@@ -362,11 +362,3 @@ interview-assistant/
 
 - **协议**：[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
 - **免责**：项目仅供学习研究，请勿用于学术不端、违规考试或其他不合规场景；使用后果自行承担。
-
-## 赞赏
-
-若对你有帮助，欢迎请作者喝杯咖啡：
-
-<p align="center">
-  <img src="docs/skm.png" width="260" alt="赞赏码" />
-</p>
