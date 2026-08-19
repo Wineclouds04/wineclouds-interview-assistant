@@ -1,0 +1,195 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Mic, MicOff, Activity, Volume2, Radio, Languages, ClipboardPaste, Keyboard, Brain, ArrowDown } from 'lucide-react'
+import { useInterviewStore } from '@/stores/configStore'
+import { api, getErrorMessage } from '@/lib/api'
+
+export default function TranscriptionPanel() {
+  const transcriptions = useInterviewStore((s) => s.transcriptions)
+  const isRecording = useInterviewStore((s) => s.isRecording)
+  const audioLevel = useInterviewStore((s) => s.audioLevel)
+  const isTranscribing = useInterviewStore((s) => s.isTranscribing)
+  const config = useInterviewStore((s) => s.config)
+  const isExamMode = config?.written_exam_mode === true
+  const contentRef = useRef<HTMLDivElement>(null)
+  const autoFollowRef = useRef(true)
+  const questionAskBusyRef = useRef(false)
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
+  const [askingQuestionIndex, setAskingQuestionIndex] = useState<number | null>(null)
+
+  const updateAutoFollow = useCallback(() => {
+    const el = contentRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 36
+    autoFollowRef.current = nearBottom
+    setShowJumpToLatest(!nearBottom && transcriptions.length > 0)
+  }, [transcriptions.length])
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    const el = contentRef.current
+    if (!el) return
+    el.scrollTo({ top: el.scrollHeight, behavior })
+    autoFollowRef.current = true
+    setShowJumpToLatest(false)
+  }, [])
+
+  useEffect(() => {
+    if (!autoFollowRef.current) {
+      setShowJumpToLatest(transcriptions.length > 0)
+      return
+    }
+    requestAnimationFrame(() => scrollToLatest('auto'))
+  }, [scrollToLatest, transcriptions])
+
+  useEffect(() => {
+    updateAutoFollow()
+  }, [updateAutoFollow])
+
+  const levelPercent = Math.min(audioLevel * 500, 100)
+
+  const handleQuestionDoubleClick = useCallback(async (index: number, text: string) => {
+    if (questionAskBusyRef.current || !text.trim()) return
+    questionAskBusyRef.current = true
+    setAskingQuestionIndex(index)
+    const contextQuestions = transcriptions.slice(Math.max(0, index - 4), index)
+    try {
+      await api.ask(text, undefined, contextQuestions)
+      useInterviewStore.getState().setToastMessage(`已提交第 ${index + 1} 题`)
+    } catch (error: unknown) {
+      useInterviewStore.getState().setToastMessage(getErrorMessage(error, '提交问题失败'))
+    } finally {
+      questionAskBusyRef.current = false
+      setAskingQuestionIndex(null)
+    }
+  }, [transcriptions])
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex items-center gap-2.5 px-4 py-3 border-b border-bg-tertiary/60 flex-shrink-0">
+        <div className="flex items-center gap-2">
+          {isRecording ? (
+            <div className="relative">
+              <Mic className="w-4 h-4 text-accent-green" />
+              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent-green recording-pulse" />
+            </div>
+          ) : (
+            <MicOff className="w-4 h-4 text-text-muted" />
+          )}
+          <span className="text-sm font-semibold tracking-tight">
+            {isRecording ? (isExamMode ? '答题中' : '正在录音') : (isExamMode ? '答题记录' : '实时转录')}
+          </span>
+        </div>
+        {isRecording && (
+          <div className="flex items-center gap-2.5 ml-auto">
+            {isTranscribing && (
+              <span className="flex items-center gap-1 text-xs text-accent-amber font-medium">
+                <Activity className="w-3 h-3 animate-pulse" />
+                转写中
+              </span>
+            )}
+            <div className="flex items-end gap-[2px] h-4">
+              {[0.6, 1.0, 0.75, 0.9, 0.5].map((scale, i) => (
+                <div
+                  key={i}
+                  className="w-[3px] rounded-full bg-accent-green/80 transition-all duration-75"
+                  style={{
+                    height: `${Math.max(15, Math.min(100, levelPercent * scale))}%`,
+                    opacity: levelPercent > 5 ? 0.5 + (levelPercent / 200) : 0.2,
+                  }}
+                />
+              ))}
+            </div>
+            <span className="text-[10px] text-text-muted font-mono tabular-nums w-8 text-right">
+              {Math.round(levelPercent)}%
+            </span>
+          </div>
+        )}
+      </div>
+
+      <div
+        ref={contentRef}
+        aria-label="转写记录"
+        className="relative flex-1 overflow-y-auto p-4 space-y-2"
+        onScroll={updateAutoFollow}
+      >
+        {transcriptions.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full gap-4">
+            <div className="relative w-14 h-14">
+              <div className={`absolute inset-0 rounded-2xl bg-gradient-to-br from-accent-blue/15 to-accent-green/10 ${isRecording ? 'animate-glow' : ''}`} />
+              <div className="relative flex items-center justify-center w-14 h-14 rounded-2xl bg-bg-tertiary/50">
+                {isRecording ? (
+                  <Activity className="w-6 h-6 text-accent-amber animate-pulse" />
+                ) : (
+                  <Mic className="w-6 h-6 text-text-muted/60" />
+                )}
+              </div>
+            </div>
+            <div className="text-center space-y-1">
+              <p className="text-text-primary text-sm font-semibold">
+                {isRecording ? (isExamMode ? '等待截图或手动输入…' : '等待语音输入…') : (isExamMode ? '笔试答题记录' : '实时语音转录')}
+              </p>
+              <p className="text-text-muted text-xs leading-relaxed">
+                {isRecording
+                  ? isExamMode
+                    ? '截图审题或手动输入问题后，AI 会自动生成答案'
+                    : '检测到语音会自动分段转录,问题会发给 AI 生成答案'
+                  : isExamMode
+                  ? '点击「开始笔试」，通过截图或输入题目获取答案'
+                  : '选择音频设备后,点击「开始面试」启动实时识别'}
+              </p>
+            </div>
+            {!isRecording && (
+              <div className="flex items-center gap-1.5 flex-wrap justify-center pt-1">
+                {(isExamMode
+                  ? [
+                      { icon: ClipboardPaste, label: '截图审题', hint: '输入框 Ctrl/⌘+V 粘贴' },
+                      { icon: Keyboard, label: '手动输入', hint: '底部输入框 + Enter' },
+                      { icon: Brain, label: 'AI 答题', hint: '自动识别题目类型并生成答案' },
+                    ]
+                  : [
+                      { icon: Volume2, label: '会议拾音', hint: '优先选 BlackHole / 系统音频 (loopback), 可录远端声音' },
+                      { icon: Radio, label: '自动断句', hint: 'VAD 静音超阈值即切段并识别' },
+                      { icon: Languages, label: '中英混读', hint: '默认中文优先, 英文术语保留原样' },
+                    ]
+                ).map(({ icon: Icon, label, hint }: { icon: typeof Mic; label: string; hint: string }) => (
+                  <span
+                    key={label}
+                    title={hint}
+                    className="inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded-full bg-bg-tertiary/50 border border-bg-hover/40 text-text-secondary"
+                  >
+                    <Icon className="w-3 h-3 text-accent-blue/70" />
+                    {label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          transcriptions.map((text, i) => (
+            <div
+              key={i}
+              className={`transcription-item px-3.5 py-2.5 rounded-lg bg-bg-tertiary/40 text-sm leading-relaxed text-text-primary cursor-pointer ${askingQuestionIndex === i ? 'opacity-60' : ''}`}
+              style={{ animationDelay: `${Math.min(i * 30, 300)}ms` }}
+              title="双击让大模型回答这道题"
+              aria-label={`双击回答第 ${i + 1} 题`}
+              onDoubleClick={() => void handleQuestionDoubleClick(i, text)}
+            >
+              <span className="text-accent-blue/70 font-mono mr-1.5 text-[10px] select-none">{String(i + 1).padStart(2, '0')}</span>
+              {text}
+            </div>
+          ))
+        )}
+        {showJumpToLatest && (
+          <button
+            type="button"
+            onClick={() => scrollToLatest()}
+            className="sticky bottom-2 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-accent-blue/35 bg-bg-secondary/95 px-3 py-1.5 text-[11px] font-medium text-accent-blue shadow-lg shadow-black/10 backdrop-blur"
+            aria-label="回到最新转写"
+          >
+            <ArrowDown className="h-3 w-3" />
+            回到最新转写
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}

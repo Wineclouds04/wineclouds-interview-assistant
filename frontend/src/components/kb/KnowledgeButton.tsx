@@ -1,0 +1,35 @@
+import { BookOpen } from 'lucide-react'
+import { useKbStore } from '@/stores/kbStore'
+
+interface KnowledgeButtonProps {
+  className?: string
+}
+
+export default function KnowledgeButton({ className = '' }: KnowledgeButtonProps) {
+  const toggleDrawer = useKbStore((s) => s.toggleDrawer)
+  const status = useKbStore((s) => s.status)
+  // KB 开了但还没文档 — 给个一直跳动的红点提示用户来上传, 否则角标永远不出现。
+  const needsDocs = !!status?.enabled && (status?.total_docs ?? 0) === 0
+
+  return (
+    <button
+      type="button"
+      onClick={toggleDrawer}
+      title={
+        needsDocs
+          ? '知识库已开启但还没有文档 — 点击上传一篇笔记'
+          : '知识库 — 让答案引用你的本地笔记'
+      }
+      aria-label="打开知识库"
+      className={`relative inline-flex items-center justify-center min-h-[32px] min-w-[32px] p-1.5 rounded-xl hover:bg-bg-tertiary/60 text-text-muted hover:text-accent-amber transition-all duration-200 border border-transparent hover:border-accent-amber/40 flex-shrink-0 ${className}`}
+    >
+      <BookOpen className="w-4 h-4" />
+      {needsDocs && (
+        <span
+          aria-hidden
+          className="absolute top-0.5 right-0.5 w-2 h-2 rounded-full bg-accent-amber ring-2 ring-bg-primary animate-pulse"
+        />
+      )}
+    </button>
+  )
+}

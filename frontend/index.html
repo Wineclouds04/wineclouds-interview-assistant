@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        try {
+          var key = 'ia-color-scheme'
+          var validThemes = [
+            'vscode-light-plus',
+            'vscode-dark-plus',
+            'vscode-dark-hc',
+            'nord',
+            'editorial-glass',
+            'solarized-dark',
+          ]
+          var theme = localStorage.getItem(key) || 'vscode-light-plus'
+          if (validThemes.indexOf(theme) < 0) theme = 'vscode-light-plus'
+          document.documentElement.setAttribute('data-theme', theme)
+          if (location.search.indexOf('overlay=1') !== -1) {
+            document.documentElement.classList.add('overlay-window')
+            document.documentElement.setAttribute('data-overlay', '1')
+            document.documentElement.style.background = 'transparent'
+          }
+        } catch {
+          document.documentElement.setAttribute('data-theme', 'vscode-light-plus')
+        }
+      })()
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>智能面试学习辅助助手</title>
+    <link rel="icon" type="image/png" href="/icon.png" />
+  </head>
+  <body class="bg-bg-primary text-text-primary">
+    <div id="root"></div>
+    <script>if(location.search.indexOf('overlay=1')!==-1){document.body.classList.add('overlay-window');document.body.style.background='transparent';var root=document.getElementById('root');if(root){root.style.background='transparent';}}</script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

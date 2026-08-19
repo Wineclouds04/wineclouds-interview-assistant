@@ -1,0 +1,879 @@
+"""
+Audio capture backend.
+
+Windows system audio (loopback): uses `soundcard` (WASAPI native, no extra drivers).
+Microphone input: uses `sounddevice` (PortAudio).
+
+Device ID scheme (all integers, frontend-compatible):
+  0 – 9 999   : sounddevice microphone devices
+  20 000+N    : soundcard WASAPI loopback speakers (N = index in speaker list)
+"""
+import numpy as np
+import threading
+import platform
+import queue
+import time
+import warnings
+import wave
+from pathlib import Path
+from typing import Callable, Optional
+
+import sounddevice as sd
+
+from core.logger import get_logger
+
+_alog = get_logger("audio")
+
+# Windows WDM-KS devices crash PortAudio with -9999; exclude them entirely
+_WDM_KS_API = "Windows WDM-KS"
+
+
+class AudioBusyError(RuntimeError):
+    """音频设备已被其他模块占用。HTTP 层应映射到 409。"""
+
+    def __init__(self, current_owner: Optional[str], requested_owner: Optional[str] = None):
+        self.current_owner = current_owner
+        self.requested_owner = requested_owner
+        super().__init__(
+            f"音频设备已被 {current_owner or '未知模块'} 占用，"
+            f"无法被 {requested_owner or '其他模块'} 启动；请先停止当前模块。"
+        )
+
+# ---------------------------------------------------------------------------
+# soundcard (Windows WASAPI loopback) – optional
+# ---------------------------------------------------------------------------
+try:
+    import soundcard as _sc
+    _HAS_SC = True
+except Exception:
+    _HAS_SC = False
+
+# Stable mapping: integer device_id (20000+N) -> soundcard speaker GUID
+# Populated by list_devices(); used by start() to find the right device.
+_SC_ID_BASE = 20000
+_SC_ID_MAP: dict[int, str] = {}   # id -> speaker.id (GUID)
+_SC_DEVICE_CACHE: dict[int, dict[str, str]] = {}   # id -> stable device metadata
+
+
+def _audio_device_sort_key(device: dict) -> tuple[int, str]:
+    """Keep the current system output first, then other loopbacks, then mics."""
+    is_loopback = bool(device.get("is_loopback"))
+    is_default_output = bool(device.get("is_default_output"))
+    if is_loopback and is_default_output:
+        priority = 0
+    elif is_loopback:
+        priority = 1
+    else:
+        priority = 2
+    return (priority, str(device.get("name") or "").lower())
+
+
+def _is_sc_id(device_id) -> bool:
+    try:
+        return int(device_id) >= _SC_ID_BASE
+    except (TypeError, ValueError):
+        return False
+
+
+def _get_sc_loopback_devices() -> list[dict]:
+    """Return soundcard-based WASAPI loopback device entries."""
+    if not _HAS_SC:
+        return []
+    previous_by_guid = {
+        meta.get("guid"): int(dev_id)
+        for dev_id, meta in _SC_DEVICE_CACHE.items()
+        if meta.get("guid")
+    }
+    previous_by_name = {
+        meta.get("name"): int(dev_id)
+        for dev_id, meta in _SC_DEVICE_CACHE.items()
+        if meta.get("name")
+    }
+    result = []
+    next_map: dict[int, str] = {}
+    next_cache: dict[int, dict[str, str]] = {}
+    used_ids: set[int] = set()
+    try:
+        default_id = _sc.default_speaker().id
+        speakers = _sc.all_speakers()
+        for n, spk in enumerate(speakers):
+            dev_id = previous_by_guid.get(spk.id) or previous_by_name.get(spk.name) or (_SC_ID_BASE + n)
+            while dev_id in used_ids:
+                dev_id += 1
+            used_ids.add(dev_id)
+            next_map[dev_id] = spk.id
+            next_cache[dev_id] = {"guid": spk.id, "name": spk.name}
+            is_default = (spk.id == default_id)
+            label = ("★ " if is_default else "") + spk.name + " (系统音频)"
+            result.append({
+                "id": dev_id,
+                "name": label,
+                "channels": getattr(spk, "channels", 2),
+                "sample_rate": 16000,
+                "is_loopback": True,
+                "category": "system_audio",
+                "host_api": "WASAPI (soundcard)",
+                "is_default_output": is_default,
+            })
+    except Exception:
+        pass
+    if next_map:
+        _SC_ID_MAP.clear()
+        _SC_ID_MAP.update(next_map)
+        _SC_DEVICE_CACHE.update(next_cache)
+    # default output first
+    result.sort(key=_audio_device_sort_key)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Resampling helpers (pure numpy – needed for sounddevice mics at 44100/48000)
+# ---------------------------------------------------------------------------
+
+def _make_lowpass_fir(cutoff_norm: float, num_taps: int = 63) -> np.ndarray:
+    n = np.arange(num_taps) - (num_taps - 1) / 2
+    h = 2.0 * cutoff_norm * np.sinc(2.0 * cutoff_norm * n)
+    h *= np.blackman(num_taps)
+    h /= h.sum()
+    return h.astype(np.float32)
+
+
+_FIR_DECIMATE_3X: np.ndarray = _make_lowpass_fir(7500 / 48000, 63)
+
+
+def _resample_chunk(audio: np.ndarray, native_sr: int, target_sr: int,
+                    state_holder: list) -> np.ndarray:
+    if native_sr == target_sr:
+        return audio
+    if native_sr == 48000 and target_sr == 16000:
+        fir = _FIR_DECIMATE_3X
+        n_overlap = len(fir) - 1
+        if state_holder[0] is None:
+            state_holder[0] = np.zeros(n_overlap, dtype=np.float32)
+        x = np.concatenate([state_holder[0], audio])
+        filtered = np.convolve(x, fir, mode="valid")
+        state_holder[0] = x[-n_overlap:]
+        return filtered[::3].astype(np.float32)
+    ratio = target_sr / native_sr
+    new_len = max(1, int(len(audio) * ratio))
+    return np.interp(np.linspace(0, len(audio) - 1, new_len),
+                     np.arange(len(audio)), audio).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# AudioCapture
+# ---------------------------------------------------------------------------
+
+class AudioCapture:
+    """Cross-platform audio capture.
+
+    On Windows, loopback (system audio) uses soundcard/WASAPI directly.
+    Microphone input uses sounddevice on all platforms.
+    """
+
+    SAMPLE_RATE = 16000
+    CHANNELS = 1
+    BLOCK_SIZE = 1024
+    DTYPE = "float32"
+    LOOPBACK_RECORDER_BLOCK_SIZE = BLOCK_SIZE * 4
+    LOOPBACK_RECORD_NUMFRAMES = BLOCK_SIZE
+    MAX_QUEUE_CHUNK_SAMPLES = BLOCK_SIZE * 4
+    MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES = 640
+
+    # AGC constants
+    AGC_NOISE_GATE = 0.003
+    AGC_TARGET     = 0.25
+    AGC_MAX_GAIN   = 10.0
+    AGC_RELEASE    = 0.995
+
+    def __init__(self):
+        self._stream: Optional[sd.InputStream] = None
+        self._running = False
+        self._audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=300)
+        self._callback: Optional[Callable[[np.ndarray], None]] = None
+        self._lock = threading.Lock()
+        # soundcard thread
+        self._sc_stop = threading.Event()
+        self._sc_thread: Optional[threading.Thread] = None
+        # resampling state for sounddevice path
+        self._resample_state: list = [None]
+        # AGC state
+        self._agc_peak: float = 0.0
+        self._use_agc: bool = False
+        # Ownership token: only one caller (for example "assist") may hold the device
+        self._owner: Optional[str] = None
+        self._dropped_chunks_count = 0
+        self._loopback_discontinuity_count = 0
+        self._max_queue_chunk_samples = 0
+        self._last_queue_chunk_samples = 0
+        self._seen_soundcard_warning_messages: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Device listing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def list_devices() -> list[dict]:
+        devices = sd.query_devices()
+        result = []
+        system = platform.system()
+
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] > 0:
+                name: str = dev["name"]
+                host_api = sd.query_hostapis(dev["hostapi"])["name"]
+                # WDM-KS crashes PortAudio on Windows
+                if system == "Windows" and host_api == _WDM_KS_API:
+                    continue
+                is_loopback = False
+                category = "microphone"
+                if system == "Darwin":
+                    lower = name.lower()
+                    if "blackhole" in lower or "soundflower" in lower or "loopback" in lower:
+                        is_loopback = True
+                        category = "system_audio"
+                elif system == "Windows":
+                    lower = name.lower()
+                    if ("loopback" in lower or "stereo mix" in lower
+                            or "立体声混音" in lower or "what u hear" in lower):
+                        is_loopback = True
+                        category = "system_audio"
+                result.append({
+                    "id": i,
+                    "name": name,
+                    "channels": dev["max_input_channels"],
+                    "sample_rate": dev["default_samplerate"],
+                    "is_loopback": is_loopback,
+                    "category": category,
+                    "host_api": host_api,
+                })
+
+        # Windows: add soundcard WASAPI loopback entries (preferred)
+        if system == "Windows":
+            sc_devs = _get_sc_loopback_devices()
+            result = sc_devs + [d for d in result if not d["is_loopback"]]
+
+        result.sort(key=_audio_device_sort_key)
+        return result
+
+    @staticmethod
+    def get_platform_info() -> dict:
+        system = platform.system()
+        info = {
+            "platform": system,
+            "needs_virtual_device": False,
+            "instructions": "",
+            "has_loopback": False,
+        }
+        if system == "Darwin":
+            devices = AudioCapture.list_devices()
+            has_loopback = any(d["is_loopback"] for d in devices)
+            info["has_loopback"] = has_loopback
+            if not has_loopback:
+                info["needs_virtual_device"] = True
+                info["instructions"] = (
+                    "⚠️ 未检测到系统音频捕获设备！\n\n"
+                    "请安装 BlackHole 虚拟音频设备：\n"
+                    "  brew install blackhole-2ch\n"
+                    "然后在「音频 MIDI 设置」中创建多输出设备。"
+                )
+        elif system == "Windows":
+            devices = AudioCapture.list_devices()
+            has_loopback = any(d["is_loopback"] for d in devices)
+            info["has_loopback"] = has_loopback
+            if not has_loopback:
+                info["needs_virtual_device"] = True
+                info["instructions"] = (
+                    "⚠️ 未检测到系统音频输出设备！\n\n"
+                    "请安装 soundcard：\n"
+                    "  pip install soundcard"
+                )
+        return info
+
+    # ------------------------------------------------------------------
+    # AGC
+    # ------------------------------------------------------------------
+
+    def _apply_agc(self, audio: np.ndarray) -> np.ndarray:
+        rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
+        self._agc_peak = max(self._agc_peak * self.AGC_RELEASE, rms)
+        if self._agc_peak > self.AGC_NOISE_GATE:
+            gain = min(self.AGC_TARGET / self._agc_peak, self.AGC_MAX_GAIN)
+            return np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+        return audio
+
+    # ------------------------------------------------------------------
+    # Start / Stop
+    # ------------------------------------------------------------------
+
+    def start(
+        self,
+        device_id,
+        on_audio: Optional[Callable[[np.ndarray], None]] = None,
+        owner: Optional[str] = None,
+        mic_compatibility_mode: bool = False,
+    ):
+        """Start audio capture on the requested device.
+
+        owner identifies the caller (for example ``"assist"``).
+        - 已运行且 owner 不一致:抛出 AudioBusyError(409)
+        - 已运行且 owner 相同:静默 no-op(等价旧行为)
+        - 已运行但当前无 owner 标签:沿用旧行为 no-op
+        """
+        with self._lock:
+            if self._running:
+                if owner is not None and self._owner is not None and self._owner != owner:
+                    raise AudioBusyError(self._owner, owner)
+                if owner is not None and self._owner is None:
+                    self._owner = owner
+                return
+            self._callback = on_audio
+            self._running = True
+            self._owner = owner
+            self._audio_queue = queue.Queue(maxsize=300)
+            self._resample_state = [None]
+            self._agc_peak = 0.0
+            self._sc_stop.clear()
+            self._dropped_chunks_count = 0
+            self._loopback_discontinuity_count = 0
+            self._max_queue_chunk_samples = 0
+            self._last_queue_chunk_samples = 0
+            self._seen_soundcard_warning_messages = set()
+
+            if _is_sc_id(device_id):
+                self._use_agc = True
+                self._start_soundcard(int(device_id))
+            else:
+                self._use_agc = False
+                self._start_sounddevice(int(device_id), mic_compatibility_mode=mic_compatibility_mode)
+
+    def _iter_queueable_chunks(self, audio: np.ndarray):
+        limit = max(1, int(getattr(self, "MAX_QUEUE_CHUNK_SAMPLES", self.BLOCK_SIZE * 4) or 1))
+        total = len(audio)
+        for start in range(0, total, limit):
+            yield audio[start:start + limit]
+
+    def _enqueue_chunk(self, audio: np.ndarray) -> None:
+        chunk_samples = int(len(audio))
+        if chunk_samples <= 0:
+            return
+        self._last_queue_chunk_samples = chunk_samples
+        self._max_queue_chunk_samples = max(self._max_queue_chunk_samples, chunk_samples)
+        if self._audio_queue.full():
+            # 队列满属异常（采集/消费速率失衡，主循环阻塞）；丢最旧块并告警，便于定位漏听。
+            try:
+                dropped = self._audio_queue.get_nowait()
+            except queue.Empty:
+                dropped = None
+            if dropped is not None:
+                self._dropped_chunks_count += 1
+                _alog.warning("audio_queue_full_dropped chunk_samples=%d", len(dropped))
+        self._audio_queue.put_nowait(audio)
+
+    def _push(self, audio: np.ndarray):
+        """Common path: optionally AGC → queue → callback."""
+        if len(audio) <= 0:
+            return
+        if audio.dtype != np.float32:
+            audio = audio.astype(np.float32)
+        if self._use_agc:
+            audio = self._apply_agc(audio)
+        for chunk in self._iter_queueable_chunks(audio):
+            self._enqueue_chunk(chunk)
+        if self._callback:
+            self._callback(audio)
+
+    # soundcard path -------------------------------------------------------
+
+    def _start_soundcard(self, device_id: int):
+        speaker_guid = _SC_ID_MAP.get(device_id)
+        if speaker_guid is None:
+            speaker_guid = _SC_DEVICE_CACHE.get(device_id, {}).get("guid")
+        if speaker_guid is None:
+            # Map may have been rebuilt; try refreshing
+            _get_sc_loopback_devices()
+            speaker_guid = _SC_ID_MAP.get(device_id)
+        if speaker_guid is None:
+            self._running = False
+            raise RuntimeError(f"找不到系统音频设备 ID={device_id}，请刷新页面重新选择设备")
+
+        stop_event = self._sc_stop
+
+        def _reader():
+            try:
+                # soundcard uses COM on Windows; must init COM in each new thread
+                import ctypes
+                try:
+                    ctypes.windll.ole32.CoInitializeEx(0, 0)
+                except Exception:
+                    pass
+
+                active_guid = speaker_guid
+                try:
+                    mic = _sc.get_microphone(active_guid, include_loopback=True)
+                except IndexError:
+                    _get_sc_loopback_devices()
+                    active_guid = _SC_ID_MAP.get(device_id) or _SC_DEVICE_CACHE.get(device_id, {}).get("guid")
+                    if active_guid is None:
+                        raise RuntimeError(f"系统音频设备已失效 ID={device_id}，请刷新页面重新选择设备")
+                    mic = _sc.get_microphone(active_guid, include_loopback=True)
+                _alog.info("soundcard loopback opened: %s", mic.name)
+                pending_chunks: list[np.ndarray] = []
+                pending_samples = 0
+                with mic.recorder(samplerate=self.SAMPLE_RATE,
+                                  channels=1,
+                                  blocksize=self.LOOPBACK_RECORDER_BLOCK_SIZE) as rec:
+                    while not stop_event.is_set() and self._running:
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always")
+                            # SoundCard docs recommend using a fixed numframes that is
+                            # noticeably smaller than blocksize on WASAPI to reduce
+                            # latency spikes and backend-sized chunk jitter.
+                            data = rec.record(numframes=self.LOOPBACK_RECORD_NUMFRAMES)
+                        if caught:
+                            for warning in caught:
+                                warning_text = str(getattr(warning, "message", "") or "")
+                                if "data discontinuity in recording" in warning_text.lower():
+                                    self._loopback_discontinuity_count += 1
+                                    _alog.warning(
+                                        "soundcard_loopback_discontinuity count=%d",
+                                        self._loopback_discontinuity_count,
+                                    )
+                                elif "fromstring is deprecated" in warning_text.lower():
+                                    continue
+                                elif warning_text not in self._seen_soundcard_warning_messages:
+                                    self._seen_soundcard_warning_messages.add(warning_text)
+                                    _alog.warning("soundcard warning: %s", warning_text)
+                        if data is None or len(data) <= 0:
+                            continue
+                        mono = data[:, 0].copy()
+                        pending_chunks.append(mono)
+                        pending_samples += len(mono)
+                        if pending_samples < self.MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES:
+                            continue
+                        self._push(np.concatenate(pending_chunks))
+                        pending_chunks = []
+                        pending_samples = 0
+                if pending_chunks:
+                    self._push(np.concatenate(pending_chunks))
+            except Exception as e:
+                _alog.error("soundcard error: %s", e, exc_info=True)
+                self._running = False
+            finally:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+        self._sc_thread = threading.Thread(target=_reader, daemon=True)
+        self._sc_thread.start()
+
+    # sounddevice (mic) path -----------------------------------------------
+
+    @staticmethod
+    def _host_api_name_for_device(device_id) -> str:
+        try:
+            dev_info = sd.query_devices(device_id, "input") if device_id is None else sd.query_devices(device_id)
+            return str(sd.query_hostapis(dev_info["hostapi"])["name"])
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _wasapi_shared_settings(host_api_name: str):
+        if platform.system() != "Windows" or "wasapi" not in host_api_name.lower():
+            return None
+        try:
+            return sd.WasapiSettings(exclusive=False, auto_convert=True)
+        except Exception:
+            return None
+
+    def _sounddevice_attempts(self, device_id: int, compatibility_mode: bool) -> list[dict]:
+        primary = sd.query_devices(device_id)
+        primary_sr = int(primary["default_samplerate"])
+        primary_host = str(sd.query_hostapis(primary["hostapi"])["name"])
+        attempts = [
+            {
+                "device": device_id,
+                "samplerate": primary_sr,
+                "native_sr": primary_sr,
+                "blocksize": self.BLOCK_SIZE,
+                "extra_settings": self._wasapi_shared_settings(primary_host),
+                "label": f"selected:{device_id} shared",
+            },
+        ]
+        if compatibility_mode:
+            if primary_sr != self.SAMPLE_RATE:
+                attempts.append(
+                    {
+                        "device": device_id,
+                        "samplerate": self.SAMPLE_RATE,
+                        "native_sr": self.SAMPLE_RATE,
+                        "blocksize": self.BLOCK_SIZE * 2,
+                        "extra_settings": self._wasapi_shared_settings(primary_host),
+                        "label": f"selected:{device_id} 16k shared",
+                    }
+                )
+            try:
+                default_input = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+                default_input = int(default_input)
+            except Exception:
+                default_input = -1
+            if default_input >= 0 and default_input != device_id:
+                default_info = sd.query_devices(default_input)
+                default_sr = int(default_info["default_samplerate"])
+                default_host = str(sd.query_hostapis(default_info["hostapi"])["name"])
+                attempts.append(
+                    {
+                        "device": default_input,
+                        "samplerate": default_sr,
+                        "native_sr": default_sr,
+                        "blocksize": self.BLOCK_SIZE * 2,
+                        "extra_settings": self._wasapi_shared_settings(default_host),
+                        "label": f"default:{default_input} shared",
+                    }
+                )
+        return attempts
+
+    def _start_sounddevice(self, device_id: int, mic_compatibility_mode: bool = False):
+        def audio_cb(indata, frames, time_info, status):
+            audio = indata[:, 0].copy() if indata.ndim > 1 else indata.copy().flatten()
+            native_sr = getattr(self, '_native_sr', self.SAMPLE_RATE)
+            audio = _resample_chunk(audio, native_sr, self.SAMPLE_RATE, self._resample_state)
+            self._push(audio)
+
+        last_error: Optional[Exception] = None
+        try:
+            attempts = self._sounddevice_attempts(device_id, mic_compatibility_mode)
+        except Exception as e:
+            self._running = False
+            raise RuntimeError(f"无法查询麦克风设备: {e}")
+
+        for attempt in attempts:
+            try:
+                self._native_sr = int(attempt["native_sr"])
+                kwargs = {
+                    "device": attempt["device"],
+                    "samplerate": attempt["samplerate"],
+                    "channels": self.CHANNELS,
+                    "dtype": self.DTYPE,
+                    "blocksize": attempt["blocksize"],
+                    "callback": audio_cb,
+                }
+                if attempt["extra_settings"] is not None:
+                    kwargs["extra_settings"] = attempt["extra_settings"]
+                self._stream = sd.InputStream(**kwargs)
+                self._stream.start()
+                _alog.info("sounddevice mic opened: %s", attempt["label"])
+                return
+            except Exception as e:
+                last_error = e
+                if self._stream:
+                    try:
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+                _alog.warning("sounddevice mic open failed (%s): %s", attempt["label"], e)
+
+        self._running = False
+        raise RuntimeError(
+            "无法以共享模式启动麦克风，候选人口述记录已关闭，不会影响会议软件。"
+            f"最后错误: {last_error}"
+        )
+
+    def stop(self, owner: Optional[str] = None, *, clear_queue: bool = True):
+        """Stop the running stream.
+
+        If owner is provided and does not match current owner, the call is
+        ignored to prevent module A from accidentally stopping module B's
+        capture. Pass owner=None to force-stop (legacy behaviour).
+        """
+        with self._lock:
+            if (
+                owner is not None
+                and self._owner is not None
+                and owner != self._owner
+            ):
+                return
+            self._running = False
+            self._sc_stop.set()
+            if self._stream:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            if self._sc_thread and self._sc_thread.is_alive():
+                self._sc_thread.join(timeout=1.0)
+            self._sc_thread = None
+            self._owner = None
+            if clear_queue:
+                # H1: 清空音频队列，避免长时间录音后内存泄漏
+                with self._audio_queue.mutex:
+                    self._audio_queue.queue.clear()
+
+    @property
+    def current_owner(self) -> Optional[str]:
+        return self._owner
+
+    # 单次最多取多少个 chunk(每个 ~64ms),避免消费者打盹后一次涌出 9 秒大块
+    # 引发 ASR 处理尖刺。32 个 chunk ≈ 2 秒音频,够 STT 一次推理用。
+    MAX_DRAIN_CHUNKS = 32
+
+    def drain_audio_chunks(
+        self,
+        timeout: float = 0.1,
+        max_chunks: Optional[int] = None,
+    ) -> list[np.ndarray]:
+        limit = max_chunks if max_chunks and max_chunks > 0 else self.MAX_DRAIN_CHUNKS
+        chunks: list[np.ndarray] = []
+        try:
+            first = self._audio_queue.get(timeout=max(0.0, timeout))
+        except queue.Empty:
+            return chunks
+        chunks.append(first)
+        while len(chunks) < limit:
+            try:
+                chunks.append(self._audio_queue.get_nowait())
+            except queue.Empty:
+                break
+        return chunks
+
+    def get_audio_chunk(
+        self,
+        timeout: float = 0.1,
+        max_chunks: Optional[int] = None,
+    ) -> Optional[np.ndarray]:
+        chunks = self.drain_audio_chunks(timeout=timeout, max_chunks=max_chunks)
+        return np.concatenate(chunks) if chunks else None
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def dropped_chunks_count(self) -> int:
+        return int(self._dropped_chunks_count)
+
+    def capture_stats_snapshot(self) -> dict[str, int]:
+        return {
+            "dropped_chunks_count": int(self._dropped_chunks_count),
+            "loopback_discontinuity_count": int(self._loopback_discontinuity_count),
+            "max_queue_chunk_samples": int(self._max_queue_chunk_samples),
+            "last_queue_chunk_samples": int(self._last_queue_chunk_samples),
+        }
+
+    @staticmethod
+    def compute_energy(audio: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(audio ** 2)))
+
+
+# ---------------------------------------------------------------------------
+# VADBuffer
+# ---------------------------------------------------------------------------
+
+class VADBuffer:
+    """Voice Activity Detection: accumulate speech, trigger after silence."""
+
+    def __init__(self, sample_rate: int = 16000, silence_threshold: float = 0.01,
+                 silence_duration: float = 2.5, min_speech_duration: float = 0.5,
+                 max_speech_duration: Optional[float] = None,
+                 preroll_duration: float = 0.0,
+                 rollover_duration: float = 0.0):
+        self.sample_rate = sample_rate
+        self.silence_threshold = silence_threshold
+        self.silence_duration = silence_duration
+        self.min_speech_duration = min_speech_duration
+        self.max_speech_duration = (
+            float(max_speech_duration)
+            if max_speech_duration and max_speech_duration > 0
+            else None
+        )
+        self.preroll_duration = max(0.0, float(preroll_duration or 0.0))
+        self.rollover_duration = max(0.0, float(rollover_duration or 0.0))
+        self._buffer: list[np.ndarray] = []
+        self._preroll: list[np.ndarray] = []
+        self._speech_started = False
+        self._silence_start: Optional[float] = None
+        self._speech_start: Optional[float] = None
+        self._speech_audio_samples = 0
+        self._preroll_samples = 0
+        self._trailing_silence_samples = 0
+        self._preroll_max_samples = int(round(self.sample_rate * self.preroll_duration))
+        self._rollover_max_samples = int(round(self.sample_rate * self.rollover_duration))
+        self._last_flush_reason: Optional[str] = None
+        self._last_segment_started_at: Optional[float] = None
+        self._last_segment_ended_at: Optional[float] = None
+
+    def _append_preroll(self, audio: np.ndarray) -> None:
+        if self._preroll_max_samples <= 0 or len(audio) <= 0:
+            return
+        self._preroll.append(audio)
+        self._preroll_samples += len(audio)
+        while self._preroll and self._preroll_samples > self._preroll_max_samples:
+            dropped = self._preroll.pop(0)
+            self._preroll_samples -= len(dropped)
+
+    def _consume_preroll(self) -> list[np.ndarray]:
+        if not self._preroll:
+            return []
+        chunks = self._preroll
+        self._preroll = []
+        self._preroll_samples = 0
+        return chunks
+
+    def _buffer_tail_chunks(self, keep_samples: int) -> list[np.ndarray]:
+        if keep_samples <= 0 or not self._buffer:
+            return []
+        remaining = keep_samples
+        kept: list[np.ndarray] = []
+        for chunk in reversed(self._buffer):
+            if remaining <= 0:
+                break
+            if len(chunk) <= remaining:
+                kept.append(chunk.copy())
+                remaining -= len(chunk)
+            else:
+                kept.append(chunk[-remaining:].copy())
+                remaining = 0
+        kept.reverse()
+        return kept
+
+    def _seed_next_segment_from_rollover(self) -> None:
+        if self._rollover_max_samples <= 0:
+            self._reset()
+            return
+        rollover_chunks = self._buffer_tail_chunks(self._rollover_max_samples)
+        self._reset()
+        if not rollover_chunks:
+            return
+        self._preroll = rollover_chunks
+        self._preroll_samples = sum(len(chunk) for chunk in rollover_chunks)
+
+    def feed(self, audio: np.ndarray) -> Optional[np.ndarray]:
+        energy = float(np.sqrt(np.mean(audio ** 2)))
+        now = time.time()
+        if energy > self.silence_threshold:
+            if not self._speech_started:
+                self._speech_started = True
+                preroll_chunks = self._consume_preroll()
+                if preroll_chunks:
+                    self._buffer.extend(preroll_chunks)
+                    self._speech_audio_samples += sum(len(chunk) for chunk in preroll_chunks)
+                    self._speech_start = now - (self._speech_audio_samples / self.sample_rate)
+                    self._last_segment_started_at = self._speech_start
+                else:
+                    self._speech_start = now
+                    self._last_segment_started_at = now
+            self._silence_start = None
+            self._trailing_silence_samples = 0
+            self._buffer.append(audio)
+            self._speech_audio_samples += len(audio)
+            if (
+                self.max_speech_duration is not None
+                and self._speech_audio_samples / self.sample_rate >= self.max_speech_duration
+            ):
+                result = np.concatenate(self._buffer)
+                self._last_flush_reason = "max_speech"
+                self._last_segment_ended_at = now
+                self._seed_next_segment_from_rollover()
+                return result
+            return None
+        if not self._speech_started:
+            self._append_preroll(audio)
+            return None
+        if self._speech_started:
+            self._buffer.append(audio)
+            self._speech_audio_samples += len(audio)
+            self._trailing_silence_samples += len(audio)
+            if self._silence_start is None:
+                self._silence_start = now
+                if self.silence_duration <= 0:
+                    return None
+            silence_elapsed_sec = self._trailing_silence_samples / self.sample_rate
+            should_flush = (
+                silence_elapsed_sec > self.silence_duration
+                if self.silence_duration <= 0
+                else silence_elapsed_sec >= self.silence_duration
+            )
+            if should_flush:
+                speech_duration = self._speech_audio_samples / self.sample_rate
+                if speech_duration >= self.min_speech_duration and self._buffer:
+                    result = np.concatenate(self._buffer)
+                    self._last_flush_reason = "silence"
+                    self._last_segment_ended_at = now
+                    self._reset()
+                    return result
+                # 片段过短被视为噪声/语气词丢弃。用 debug 避免刷屏；排查漏听时把 logger 调到 DEBUG。
+                _alog.debug(
+                    "vad_drop_short_segment duration=%.2fs threshold=%.2fs samples=%d",
+                    speech_duration, self.min_speech_duration, self._speech_audio_samples,
+                )
+                self._reset()
+        return None
+
+    def flush(self) -> Optional[np.ndarray]:
+        if self._buffer:
+            result = np.concatenate(self._buffer)
+            self._last_flush_reason = "stop_flush"
+            self._last_segment_ended_at = time.time()
+            self._reset()
+            return result
+        return None
+
+    def _reset(self):
+        self._buffer.clear()
+        self._speech_started = False
+        self._silence_start = None
+        self._speech_start = None
+        self._speech_audio_samples = 0
+        self._trailing_silence_samples = 0
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._speech_started and self._silence_start is None
+
+    @property
+    def has_pending_audio(self) -> bool:
+        return self._speech_started and bool(self._buffer)
+
+    def pending_audio(self) -> Optional[np.ndarray]:
+        if not self._buffer:
+            return None
+        return np.concatenate(self._buffer)
+
+    @property
+    def last_flush_reason(self) -> Optional[str]:
+        return self._last_flush_reason
+
+    @property
+    def last_segment_started_at(self) -> Optional[float]:
+        return self._last_segment_started_at
+
+    @property
+    def last_segment_ended_at(self) -> Optional[float]:
+        return self._last_segment_ended_at
+
+
+audio_capture = AudioCapture()
+
+
+def load_wav_file(path: str | Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(path), 'rb') as wf:
+        sr = wf.getframerate()
+        channels = wf.getnchannels()
+        width = wf.getsampwidth()
+        frames = wf.readframes(wf.getnframes())
+    if width != 2:
+        raise RuntimeError('仅支持 16-bit PCM WAV 测试音频')
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return audio.astype(np.float32), sr
+
+
+def play_audio_file(path: str | Path):
+    audio, sr = load_wav_file(path)
+    sd.play(audio, sr)
+    sd.wait()

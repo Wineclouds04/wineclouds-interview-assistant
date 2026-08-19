@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Node
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+.npm
+.yarn-integrity
+
+# Config & secrets (do not commit)
+backend/config.json
+backend/user_config.json
+.env
+.env.*
+.env.local
+*.local
+*.python-version
+
+# SQLite database（统一 backend/data/；根目录旧库可手动删除）
+backend/data/*.db
+backend/data/*.db-wal
+backend/data/*.db-shm
+# 用户上传的简历原件
+backend/data/resume_uploads/
+backend/knowledge.db
+backend/knowledge.db-shm
+backend/knowledge.db-wal
+backend/job_tracker.db
+backend/job_tracker.db-shm
+backend/job_tracker.db-wal
+
+# Review 面试复盘数据库（包含真实面试记录，不提交）
+backend/data/review.db
+backend/data/review.db-wal
+backend/data/review.db-shm
+
+# Knowledge Base（用户上传的笔记/文件 + FTS 索引 + OCR/Vision 缓存）
+backend/data/kb/
+backend/data/kb.sqlite
+backend/data/kb.sqlite-*
+backend/data/kb_cache/
+
+# Whisper / model cache
+*.bin
+*.pt
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+Desktop.ini
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.sublime-*
+
+# Logs (contain transcription/answer data, sensitive)
+log/
+
+# Cache & temp
+.cache/
+*.log
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# Screenshots (generated, large binary)
+/docs/superpowers/**
+docs/screenshots/review/
+frontend/output/
+output/
+
+# Playwright
+.playwright-cli/
+frontend/playwright-report/
+frontend/test-results/
+frontend/.playwright-cli/
+frontend/blob-report/
+frontend/.last-run.json
+
+CODE_REVIEW.md
+.omx/

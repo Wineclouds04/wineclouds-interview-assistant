@@ -1,0 +1,16 @@
+{
+  "name": "interview-assistant-desktop",
+  "version": "1.0.0",
+  "description": "智能面试学习辅助助手 - Electron 桌面端",
+  "appDisplayName": "智能面试学习辅助助手",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^41.3.0"
+  },
+  "allowScripts": {
+    "electron@41.3.0": true
+  }
+}

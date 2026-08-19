@@ -1,0 +1,587 @@
+import { useEffect, useState, useCallback, useMemo } from 'react'
+import { api } from '@/lib/api'
+import { useInterviewStore } from '@/stores/configStore'
+import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import { RefreshCw, Trash2, ChevronDown, ChevronUp, Target, TrendingUp, TrendingDown, Minus, Sparkles, Mic, BookOpen, Loader2, AlertCircle } from 'lucide-react'
+import {
+  ASSIST_MERGE_GAP_SEC,
+  mergeHistoryByTimeGap,
+  type HistoryRecord,
+} from './knowledge-map/mergeHistory'
+
+interface TagSummary {
+  tag: string
+  count: number
+  avg_score: number | null
+  trend: 'up' | 'down' | 'stable'
+}
+
+interface InputMonitorStatus {
+  running: boolean
+  device_id: number | null
+  rms: number
+  peak: number
+  level_pct: number
+  has_signal: boolean
+  error?: string | null
+}
+
+function trendLabel(trend: string) {
+  if (trend === 'up') return '上升'
+  if (trend === 'down') return '下降'
+  return '持平'
+}
+
+function RadarChart({ tags }: { tags: TagSummary[] }) {
+  const top = tags.filter(t => t.avg_score !== null).slice(0, 8)
+  if (top.length < 3) {
+    return (
+      <div className="flex items-center justify-center h-48 text-text-muted text-xs">
+        至少需要 3 个有评分的知识点才能显示雷达图
+      </div>
+    )
+  }
+
+  const cx = 150, cy = 130, r = 90
+  const n = top.length
+  const points = top.map((t, i) => {
+    const angle = (Math.PI * 2 * i) / n - Math.PI / 2
+    const val = (t.avg_score ?? 0) / 10
+    return {
+      x: cx + r * val * Math.cos(angle),
+      y: cy + r * val * Math.sin(angle),
+      lx: cx + (r + 20) * Math.cos(angle),
+      ly: cy + (r + 20) * Math.sin(angle),
+      tag: t.tag,
+      score: t.avg_score,
+      count: t.count,
+      trend: t.trend,
+    }
+  })
+
+  const gridLevels = [0.25, 0.5, 0.75, 1.0]
+  const polyStr = points.map(p => `${p.x},${p.y}`).join(' ')
+
+  return (
+    <svg viewBox="0 0 300 260" className="w-full max-w-[320px] mx-auto" role="img" aria-label="知识点掌握度雷达图">
+      <title>知识点掌握度 (0-10 分)</title>
+      <desc>
+        {top.map(t => `${t.tag}: ${t.avg_score?.toFixed(1) ?? '无评分'}分, ${t.count}次, 趋势${trendLabel(t.trend)}`).join('; ')}
+      </desc>
+      {gridLevels.map(level => {
+        const gp = Array.from({ length: n }, (_, i) => {
+          const angle = (Math.PI * 2 * i) / n - Math.PI / 2
+          return `${cx + r * level * Math.cos(angle)},${cy + r * level * Math.sin(angle)}`
+        }).join(' ')
+        return <polygon key={level} points={gp} fill="none" stroke="currentColor" className="text-bg-hover" strokeWidth="0.5" />
+      })}
+      {points.map((p, i) => (
+        <line key={i} x1={cx} y1={cy} x2={cx + r * Math.cos((Math.PI * 2 * i) / n - Math.PI / 2)}
+          y2={cy + r * Math.sin((Math.PI * 2 * i) / n - Math.PI / 2)}
+          stroke="currentColor" className="text-bg-hover" strokeWidth="0.5" />
+      ))}
+      <polygon
+        points={polyStr}
+        className="fill-accent-blue/15 stroke-accent-blue"
+        strokeWidth="1.5"
+      />
+      {points.map((p, i) => {
+        const tooltip = `${p.tag} · ${p.score?.toFixed(1) ?? '--'}/10 · ${p.count}次 · 趋势${trendLabel(p.trend)}`
+        return (
+          <g key={i}>
+            {/* 扩大命中半径, 便于 hover / 触控点中 */}
+            <circle cx={p.x} cy={p.y} r="10" fill="transparent" className="cursor-help">
+              <title>{tooltip}</title>
+            </circle>
+            <circle cx={p.x} cy={p.y} r="3" className="fill-accent-blue" />
+            <text x={p.lx} y={p.ly} textAnchor="middle" dominantBaseline="middle"
+              className="fill-text-secondary" fontSize="9">{p.tag}
+              <title>{tooltip}</title>
+            </text>
+            <text x={p.lx} y={p.ly + 12} textAnchor="middle"
+              className="fill-text-muted" fontSize="8">{p.score?.toFixed(1)}</text>
+          </g>
+        )
+      })}
+    </svg>
+  )
+}
+
+function TrendIcon({ trend }: { trend: string }) {
+  if (trend === 'up') return <TrendingUp className="w-3 h-3 text-accent-green" />
+  if (trend === 'down') return <TrendingDown className="w-3 h-3 text-accent-red" />
+  return <Minus className="w-3 h-3 text-text-muted" />
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === 'string' && error.trim()) return error
+  return fallback
+}
+
+export default function KnowledgeMap() {
+  const [tags, setTags] = useState<TagSummary[]>([])
+  /** 接口返回的原始行（分页累积），合并仅用于展示 */
+  const [rawHistory, setRawHistory] = useState<HistoryRecord[]>([])
+  const [historyTotal, setHistoryTotal] = useState(0)
+  const [historyPage, setHistoryPage] = useState(1)
+  const [expandedId, setExpandedId] = useState<number | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [firstLoaded, setFirstLoaded] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [genLoading, setGenLoading] = useState(false)
+  const [inputMonitorStatus, setInputMonitorStatus] = useState<InputMonitorStatus | null>(null)
+  const [inputMonitorError, setInputMonitorError] = useState<string | null>(null)
+  const setAppMode = useUiPrefsStore((s) => s.setAppMode)
+  const candidateTranscriptions = useInterviewStore((s) => s.candidateTranscriptions)
+  const candidateSttLoaded = useInterviewStore((s) => s.candidateSttLoaded ?? false)
+  const candidateSttLoading = useInterviewStore((s) => s.candidateSttLoading ?? false)
+  const candidateSttProvider = useInterviewStore((s) => s.candidateSttProvider ?? '')
+  const candidateCaptureEnabled = useInterviewStore((s) => s.config?.candidate_asr_enabled)
+
+  const history = useMemo(() => mergeHistoryByTimeGap(rawHistory), [rawHistory])
+  const latestCandidateTranscript = useMemo(
+    () => candidateTranscriptions.slice(-1)[0]?.trim() ?? '',
+    [candidateTranscriptions],
+  )
+  const candidateContextCount = useMemo(
+    () => candidateTranscriptions.filter((text) => text.trim()).length,
+    [candidateTranscriptions],
+  )
+  const inputLevelPct = Math.max(0, Math.min(100, Math.round(inputMonitorStatus?.level_pct ?? 0)))
+  const inputMonitorRunning = inputMonitorStatus?.running === true
+  const candidateAsrStatus = candidateCaptureEnabled === false
+    ? '未开启'
+    : candidateSttLoading
+      ? '加载中'
+      : candidateSttLoaded
+        ? `${candidateSttProvider || 'ASR'} 已就绪`
+        : candidateCaptureEnabled
+          ? '等待启动'
+          : '等待配置'
+
+  const loadData = useCallback(async () => {
+    setLoading(true)
+    setLoadError(null)
+    try {
+      const [sumRes, histRes] = await Promise.all([
+        api.knowledgeSummary(),
+        api.knowledgeHistory(1, 20),
+      ])
+      setTags(sumRes.tags || [])
+      setRawHistory(histRes.records || [])
+      setHistoryTotal(histRes.total || 0)
+      setHistoryPage(1)
+    } catch (e) {
+      const message = getErrorMessage(e, '加载能力分析失败')
+      setLoadError(message)
+      useInterviewStore.getState().setToastMessage(message)
+    }
+    setLoading(false)
+    setFirstLoaded(true)
+  }, [])
+
+  useEffect(() => { loadData() }, [loadData])
+
+  useEffect(() => {
+    let cancelled = false
+    const pollInputMonitor = async () => {
+      try {
+        const status = await api.audioInputMonitorStatus()
+        if (cancelled) return
+        setInputMonitorStatus(status)
+        setInputMonitorError(status.error || null)
+      } catch {
+        if (!cancelled) setInputMonitorError('读取麦克风测试状态失败')
+      }
+    }
+    void pollInputMonitor()
+    const timer = window.setInterval(pollInputMonitor, 800)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  const loadMoreHistory = async () => {
+    const next = historyPage + 1
+    setLoadError(null)
+    try {
+      const res = await api.knowledgeHistory(next, 20)
+      setRawHistory((prev) => [...prev, ...(res.records || [])])
+      setHistoryPage(next)
+    } catch (e) {
+      const message = getErrorMessage(e, '加载更多历史失败')
+      setLoadError(message)
+      useInterviewStore.getState().setToastMessage(message)
+    }
+  }
+
+  const handleReset = async () => {
+    if (!confirm('确定要清空所有知识记录吗？清空后不可恢复。')) return
+    try {
+      await api.knowledgeReset()
+      loadData()
+    } catch (e) {
+      const message = getErrorMessage(e, '清空能力记录失败')
+      setLoadError(message)
+      useInterviewStore.getState().setToastMessage(message)
+    }
+  }
+
+  const handleGenerateReview = async () => {
+    setGenLoading(true)
+    try {
+      const scoredWeakTags = tags
+        .filter(t => t.avg_score !== null)
+        .sort((a, b) => (a.avg_score ?? 10) - (b.avg_score ?? 10))
+        .slice(0, 3)
+        .map(t => t.tag)
+      const fallbackFrequentTags = tags
+        .filter(t => t.avg_score === null)
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 3)
+        .map(t => t.tag)
+      const reviewTags = scoredWeakTags.length > 0 ? scoredWeakTags : fallbackFrequentTags
+
+      if (reviewTags.length === 0) {
+        useInterviewStore.getState().setToastMessage('暂无可复习知识点，多做几道题再来')
+        setGenLoading(false)
+        return
+      }
+
+      const text = scoredWeakTags.length > 0
+        ? `请针对以下薄弱知识点出 3 道面试题：${reviewTags.join('、')}`
+        : `请针对以下高频但尚未评分的知识点出 3 道面试题，并给出评分要点：${reviewTags.join('、')}`
+      await api.ask(text)
+    } catch (e) {
+      useInterviewStore.getState().setToastMessage(getErrorMessage(e, '生成复习题失败'))
+    }
+    setGenLoading(false)
+  }
+
+  const weakTags = tags
+    .filter(t => t.avg_score !== null)
+    .sort((a, b) => (a.avg_score ?? 10) - (b.avg_score ?? 10))
+  const unscoredTags = tags
+    .filter(t => t.avg_score === null)
+    .sort((a, b) => b.count - a.count)
+  const scoredRecordCount = rawHistory.filter((rec) => rec.score !== null && !Number.isNaN(rec.score)).length
+  const spokenRecordCount = rawHistory.filter((rec) => rec.candidate_answer?.trim()).length
+  const loadedRecordCount = rawHistory.length
+  const scoreCoveragePct = loadedRecordCount > 0 ? Math.round((scoredRecordCount / loadedRecordCount) * 100) : 0
+  const spokenCoveragePct = loadedRecordCount > 0 ? Math.round((spokenRecordCount / loadedRecordCount) * 100) : 0
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 space-y-6">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-text-primary flex items-center gap-2">
+          <Target className="w-4 h-4 text-accent-blue" />
+          能力分析
+        </h2>
+        <div className="flex items-center gap-2">
+          <button onClick={loadData} disabled={loading}
+            className="p-1.5 rounded-lg hover:bg-bg-tertiary text-text-muted hover:text-text-primary transition-colors">
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+          </button>
+          <button onClick={handleReset}
+            className="p-1.5 rounded-lg hover:bg-bg-tertiary text-text-muted hover:text-accent-red transition-colors">
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {(tags.length > 0 || rawHistory.length > 0) && (
+        <div className="grid gap-2 sm:grid-cols-3">
+          <div className="rounded-xl border border-bg-tertiary bg-bg-secondary px-3 py-2">
+            <p className="text-[10px] text-text-muted">画像样本</p>
+            <p className="mt-1 text-sm font-semibold text-text-primary">
+              {historyTotal || rawHistory.length}
+              <span className="ml-1 text-[10px] font-normal text-text-muted">条问答</span>
+            </p>
+            <p className="mt-0.5 text-[10px] text-text-muted">实时辅助 + 面试复盘共同沉淀</p>
+          </div>
+          <div className="rounded-xl border border-bg-tertiary bg-bg-secondary px-3 py-2">
+            <p className="text-[10px] text-text-muted">当前加载口述覆盖</p>
+            <p className="mt-1 text-sm font-semibold text-text-primary">
+              {spokenCoveragePct}%
+              <span className="ml-1 text-[10px] font-normal text-text-muted">当前页样本</span>
+            </p>
+            <p className="mt-0.5 text-[10px] text-text-muted">{spokenRecordCount}/{loadedRecordCount || 0} 条含候选人真实回答</p>
+          </div>
+          <div className="rounded-xl border border-bg-tertiary bg-bg-secondary px-3 py-2">
+            <p className="text-[10px] text-text-muted">当前加载评分覆盖</p>
+            <p className="mt-1 text-sm font-semibold text-text-primary">
+              {scoreCoveragePct}%
+              <span className="ml-1 text-[10px] font-normal text-text-muted">当前页样本</span>
+            </p>
+            <p className="mt-0.5 text-[10px] text-text-muted">{scoredRecordCount}/{loadedRecordCount || 0} 条可进入雷达图</p>
+          </div>
+        </div>
+      )}
+
+      <div className="bg-bg-secondary rounded-xl p-3 border border-bg-tertiary space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h3 className="text-xs font-medium text-text-secondary flex items-center gap-1.5">
+            <Mic className="w-3.5 h-3.5 text-accent-blue" />
+            口述输入联动
+          </h3>
+          <span className="text-[10px] text-text-muted shrink-0">
+            {candidateContextCount > 0 ? `已采样 ${candidateContextCount} 段` : '暂无口述样本'}
+          </span>
+        </div>
+        <div className="grid gap-3 md:grid-cols-[1fr_1fr_1.4fr]">
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-[10px]">
+              <span className="text-text-muted">麦克风测试</span>
+              <span className={inputMonitorRunning ? 'text-accent-green' : 'text-text-muted'}>
+                {inputMonitorRunning ? `${inputLevelPct}%` : '未打开测试监听'}
+              </span>
+            </div>
+            <div className="h-2 rounded-full bg-bg-tertiary overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all ${inputMonitorRunning ? 'bg-accent-green' : 'bg-bg-hover'}`}
+                style={{ width: `${inputMonitorRunning ? inputLevelPct : 0}%` }}
+              />
+            </div>
+            {inputMonitorError && <p className="text-[10px] text-accent-red truncate">{inputMonitorError}</p>}
+          </div>
+          <div className="space-y-1">
+            <p className="text-[10px] text-text-muted">真实口述 ASR</p>
+            <p className="text-xs text-text-primary">{candidateAsrStatus}</p>
+            <p className="text-[10px] text-text-muted">
+              {candidateCaptureEnabled === false ? '设置页开启后可参与追问上下文' : '下一轮追问优先参考真实回答'}
+            </p>
+          </div>
+          <div className="min-w-0 space-y-1">
+            <p className="text-[10px] text-text-muted">最近口述</p>
+            <p className="text-xs text-text-primary truncate">
+              {latestCandidateTranscript || '还没有从“我的麦克风”采集到回答'}
+            </p>
+            <p className="text-[10px] text-text-muted truncate">
+              能力分析会结合已入库问答和候选人实际回答；未开启口述时按旧问答画像。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {loadError && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-accent-red/30 bg-accent-red/10 px-3 py-2 text-xs text-accent-red">
+          <span className="flex min-w-0 items-center gap-2">
+            <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+            <span className="min-w-0 break-words">能力分析数据读取失败：{loadError}</span>
+          </span>
+          <button
+            type="button"
+            onClick={loadData}
+            disabled={loading}
+            className="inline-flex items-center gap-1 rounded-md border border-accent-red/30 px-2 py-1 font-medium hover:bg-accent-red/10 disabled:opacity-60"
+          >
+            <RefreshCw className={`h-3 w-3 ${loading ? 'animate-spin' : ''}`} />
+            重试
+          </button>
+        </div>
+      )}
+
+      {!firstLoaded && loading ? (
+        <div className="flex flex-col items-center justify-center py-20 text-text-muted gap-3">
+          <Loader2 className="w-6 h-6 animate-spin text-accent-blue/70" />
+          <p className="text-xs">正在加载能力分析数据…</p>
+        </div>
+      ) : loadError && tags.length === 0 && rawHistory.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-12 gap-4 max-w-md mx-auto text-center">
+          <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-accent-red/25 bg-accent-red/10">
+            <AlertCircle className="h-7 w-7 text-accent-red/80" />
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-sm font-semibold text-text-primary">能力数据暂时读不到</p>
+            <p className="text-xs leading-relaxed text-text-muted">
+              请检查后端连接、鉴权或本地数据库状态；修复后点击重试即可重新加载。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={loadData}
+            disabled={loading}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-accent-blue px-3 py-2 text-xs font-medium text-white shadow-sm shadow-accent-blue/20 hover:brightness-110 disabled:opacity-60"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+            重试加载
+          </button>
+        </div>
+      ) : tags.length === 0 && rawHistory.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-12 gap-5 max-w-md mx-auto text-center">
+          <div className="relative w-20 h-20">
+            <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-accent-blue/15 to-violet-500/10 animate-glow" />
+            <div className="relative flex items-center justify-center w-20 h-20 rounded-2xl bg-bg-tertiary/50 border border-bg-hover/40">
+              <Target className="w-9 h-9 text-accent-blue/70" />
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-text-primary text-sm font-semibold flex items-center justify-center gap-1.5">
+              还没有能力画像
+              <Sparkles className="w-3.5 h-3.5 text-accent-amber/80" />
+            </p>
+            <p className="text-text-muted text-xs leading-relaxed">
+              完成几次「实时辅助」或「面试复盘」后，系统会自动从问答中提取知识点，
+              <br className="hidden sm:inline" />
+              生成雷达图、薄弱点排名和历史记录。
+            </p>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap justify-center">
+            <button
+              type="button"
+              onClick={() => setAppMode('assist')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-accent-blue text-white text-xs font-medium shadow-sm shadow-accent-blue/20 hover:brightness-110 transition"
+            >
+              <Mic className="w-3.5 h-3.5" />
+              开始实时辅助
+            </button>
+            <button
+              type="button"
+              onClick={() => setAppMode('review')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-bg-tertiary/60 border border-bg-hover/60 text-text-primary text-xs font-medium hover:bg-bg-hover/60 transition"
+            >
+              <BookOpen className="w-3.5 h-3.5 text-accent-blue" />
+              进入面试复盘
+            </button>
+          </div>
+          <p className="text-[10px] text-text-muted/70 max-w-xs leading-relaxed">
+            小贴士:完成越多不同主题的问答,雷达图越有参考价值;一次对话里的多条提问会按 {ASSIST_MERGE_GAP_SEC} 秒间隔自动合并。
+          </p>
+        </div>
+      ) : (
+        <>
+          {/* Radar */}
+          <div className="bg-bg-secondary rounded-xl p-4 border border-bg-tertiary">
+            <h3 className="text-xs font-medium text-text-secondary mb-2">知识点掌握度</h3>
+            <RadarChart tags={tags} />
+          </div>
+
+          {/* Weak points */}
+          <div className="bg-bg-secondary rounded-xl p-4 border border-bg-tertiary">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-medium text-text-secondary">薄弱点排名</h3>
+              <button onClick={handleGenerateReview} disabled={genLoading}
+                className="text-[10px] px-2 py-1 rounded-md bg-accent-blue/10 text-accent-blue hover:bg-accent-blue/20 transition-colors disabled:opacity-50">
+                {genLoading ? '生成中...' : '生成针对性复习题'}
+              </button>
+            </div>
+            <div className="space-y-2">
+              {weakTags.length > 0 ? (
+                weakTags.slice(0, 10).map((t, i) => (
+                  <div key={t.tag} className="flex items-center gap-3 text-xs">
+                    <span className="w-4 text-text-muted text-right">{i + 1}</span>
+                    <span className="flex-1 text-text-primary truncate">{t.tag}</span>
+                    <div className="w-20 h-1.5 bg-bg-tertiary rounded-full overflow-hidden">
+                      <div className="h-full rounded-full transition-all"
+                        style={{
+                          width: `${((t.avg_score ?? 0) / 10) * 100}%`,
+                          backgroundColor: (t.avg_score ?? 0) >= 7 ? '#22c55e' : (t.avg_score ?? 0) >= 4 ? '#f59e0b' : '#ef4444'
+                        }} />
+                    </div>
+                    <span className="w-8 text-right text-text-muted">{t.avg_score?.toFixed(1)}</span>
+                    <TrendIcon trend={t.trend} />
+                    <span className="w-8 text-right text-text-muted">{t.count}次</span>
+                  </div>
+                ))
+              ) : (
+                <div className="rounded-lg border border-bg-hover/60 bg-bg-tertiary/30 px-3 py-3">
+                  <p className="text-xs font-medium text-text-secondary">还没有评分样本</p>
+                  <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+                    实时辅助记录会先沉淀为知识点；完成复盘分析后会补充分数。现在也可以按高频知识点生成练习题。
+                  </p>
+                  {unscoredTags.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {unscoredTags.slice(0, 6).map((tag) => (
+                        <span key={tag.tag} className="rounded bg-bg-primary/70 px-1.5 py-0.5 text-[10px] text-text-secondary">
+                          {tag.tag} · {tag.count}次
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* History */}
+          <div className="bg-bg-secondary rounded-xl p-4 border border-bg-tertiary">
+            <h3 className="text-xs font-medium text-text-secondary mb-1">
+              历史记录{' '}
+              <span className="text-text-muted">
+                ({history.length} 组{rawHistory.length !== history.length ? ` · 原始 ${rawHistory.length} 条` : ''})
+              </span>
+            </h3>
+            <p className="text-[10px] text-text-muted mb-3 leading-snug">
+              同一次辅助/练习中、间隔在约 {ASSIST_MERGE_GAP_SEC} 秒内的连续语音提问会合并为一行，便于阅读；展开可查看合并后的完整问答。
+            </p>
+            <div className="space-y-2">
+              {history.map((rec) => (
+                <div key={`${rec.id}-${rec.mergedCount ?? 1}`} className="border border-bg-tertiary rounded-lg overflow-hidden">
+                  <button onClick={() => setExpandedId(expandedId === rec.id ? null : rec.id)}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-bg-tertiary/50 transition-colors">
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded bg-accent-green/10 text-accent-green`}>
+                      辅助
+                    </span>
+                    {rec.mergedCount != null && rec.mergedCount > 1 && (
+                      <span className="text-[9px] px-1 py-0.5 rounded bg-bg-tertiary text-text-muted shrink-0" title="由多条语音识别片段合并">
+                        ×{rec.mergedCount}
+                      </span>
+                    )}
+                    {rec.candidate_answer?.trim() && (
+                      <span className="text-[9px] px-1 py-0.5 rounded bg-accent-blue/10 text-accent-blue shrink-0" title="这条画像包含候选人实际口述">
+                        含口述
+                      </span>
+                    )}
+                    <span className="flex-1 text-xs text-text-primary truncate">{rec.question}</span>
+                    {rec.score !== null && <span className="text-[10px] text-accent-amber">{rec.score}/10</span>}
+                    <span className="text-[10px] text-text-muted">
+                      {new Date(rec.created_at * 1000).toLocaleDateString()}
+                    </span>
+                    {expandedId === rec.id ? <ChevronUp className="w-3 h-3 text-text-muted" /> : <ChevronDown className="w-3 h-3 text-text-muted" />}
+                  </button>
+                  {expandedId === rec.id && (
+                    <div className="px-3 pb-3 space-y-2 border-t border-bg-tertiary">
+                      <div className="pt-2">
+                        <p className="text-[10px] text-text-muted mb-1">问题（合并展示）</p>
+                        <p className="text-xs text-text-primary whitespace-pre-wrap leading-relaxed">{rec.question || '(无)'}</p>
+                      </div>
+                      {rec.candidate_answer?.trim() && (
+                        <div>
+                          <p className="text-[10px] text-text-muted mb-1">候选人实际回答{rec.mergedCount != null && rec.mergedCount > 1 ? '（多段按顺序拼接）' : ''}</p>
+                          <p className="text-xs text-text-primary whitespace-pre-wrap leading-relaxed max-h-[min(50vh,18rem)] overflow-y-auto">
+                            {rec.candidate_answer}
+                          </p>
+                        </div>
+                      )}
+                      <div>
+                        <p className="text-[10px] text-text-muted mb-1">助手参考答案{rec.mergedCount != null && rec.mergedCount > 1 ? '（多段按顺序拼接）' : ''}</p>
+                        <p className="text-xs text-text-secondary whitespace-pre-wrap leading-relaxed max-h-[min(50vh,24rem)] overflow-y-auto">
+                          {rec.answer?.trim() ? rec.answer : '(无回答)'}
+                        </p>
+                      </div>
+                      {rec.tags.length > 0 && (
+                        <div className="flex flex-wrap gap-1 pt-1">
+                          {rec.tags.map(tag => (
+                            <span key={tag} className="text-[10px] px-1.5 py-0.5 bg-bg-tertiary text-text-muted rounded">{tag}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+            {rawHistory.length < historyTotal && (
+              <button onClick={loadMoreHistory}
+                className="w-full mt-3 py-2 text-xs text-accent-blue hover:text-accent-blue/80 transition-colors">
+                加载更多
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}

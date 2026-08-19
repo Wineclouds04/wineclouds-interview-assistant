@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""Unified launcher for the interview assistant."""
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
+from urllib.request import urlopen
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.join(ROOT, "backend")
+FRONTEND_DIR = os.path.join(ROOT, "frontend")
+FRONTEND_DIST = os.path.join(FRONTEND_DIR, "dist")
+DESKTOP_DIR = os.path.join(ROOT, "desktop")
+
+REQUIREMENTS = os.path.join(BACKEND_DIR, "requirements.txt")
+HIDE_CONSOLE_ENV = "IA_HIDE_CONSOLE"
+NTFY_EXE_ENV = "IA_NTFY_EXE"
+NTFY_CONFIG = os.path.join(BACKEND_DIR, "config.json")
+
+
+# ---------------------------------------------------------------------------
+# Console helpers
+# ---------------------------------------------------------------------------
+
+def _set_utf8_console():
+    """Windows: switch active code page to UTF-8 so Unicode chars render."""
+    if platform.system() != "Windows":
+        return
+    try:
+        subprocess.run(["chcp", "65001"], capture_output=True, shell=True)
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def _hidden_process_kwargs() -> dict:
+    if platform.system() != "Windows":
+        return {}
+    if os.environ.get(HIDE_CONSOLE_ENV, "").strip().lower() not in ("1", "true", "yes"):
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+
+
+def get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# Local ntfy server
+# ---------------------------------------------------------------------------
+
+def _load_local_ntfy_settings() -> Optional[tuple[str, int]]:
+    """Return the configured local ntfy base URL and port when autostart applies."""
+    try:
+        with open(NTFY_CONFIG, "r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except (OSError, ValueError) as exc:
+        print(f"[WARN] 无法读取 ntfy 配置，跳过本地服务启动: {exc}")
+        return None
+
+    if not config.get("ntfy_enabled", False):
+        return None
+
+    server_url = str(config.get("ntfy_server_url", "")).strip().rstrip("/")
+    parsed = urlparse(server_url)
+    if parsed.scheme != "http" or not parsed.hostname:
+        # Public HTTPS ntfy services are remote dependencies and must not be
+        # replaced by a locally spawned HTTP server.
+        return None
+
+    local_hosts = {"localhost", "127.0.0.1", "::1", get_local_ip()}
+    try:
+        local_hosts.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    if parsed.hostname.lower() not in {host.lower() for host in local_hosts if host}:
+        return None
+
+    try:
+        port = parsed.port or 80
+    except ValueError:
+        print(f"[WARN] ntfy 服务地址端口无效: {server_url}")
+        return None
+    return server_url, port
+
+
+def _find_ntfy_executable() -> Optional[str]:
+    """Find a local ntfy binary without requiring it to be on PATH."""
+    candidates: list[Path] = []
+    configured = os.environ.get(NTFY_EXE_ENV, "").strip()
+    if configured:
+        candidates.append(Path(configured))
+
+    on_path = shutil.which("ntfy") or shutil.which("ntfy.exe")
+    if on_path:
+        candidates.append(Path(on_path))
+
+    candidates.extend([
+        Path(ROOT) / "tools" / "ntfy" / "ntfy.exe",
+        Path(ROOT) / "ntfy.exe",
+    ])
+
+    # Official Windows archives commonly unpack directly under the drive root,
+    # for example D:\\ntfy_2.27.0_windows_amd64\\ntfy.exe.
+    if platform.system() == "Windows":
+        drive_root = Path(ROOT).anchor
+        if drive_root:
+            try:
+                unpacked = list(Path(drive_root).glob("ntfy_*_windows_amd64/ntfy.exe"))
+                unpacked.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+                candidates.extend(unpacked)
+            except OSError:
+                pass
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate.resolve())
+        except OSError:
+            continue
+    return None
+
+
+def _is_tcp_port_open(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _is_ntfy_healthy(port: int) -> bool:
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/v1/health", timeout=0.5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return response.status == 200 and payload.get("healthy") is True
+    except (OSError, ValueError):
+        return False
+
+
+def ensure_local_ntfy_server(wait_seconds: float = 6.0) -> bool:
+    """Start the configured local ntfy server, or reuse the running instance.
+
+    ntfy is an auxiliary notification channel, so startup failures are reported
+    but never prevent the interview assistant backend from starting.
+    """
+    settings = _load_local_ntfy_settings()
+    if settings is None:
+        return True
+    server_url, port = settings
+
+    if _is_ntfy_healthy(port):
+        print(f"[OK] ntfy 服务已运行: {server_url}")
+        return True
+    if _is_tcp_port_open(port):
+        print(f"[WARN] 端口 {port} 已被非 ntfy 服务占用，跳过 ntfy 启动。")
+        return False
+
+    executable = _find_ntfy_executable()
+    if executable is None:
+        print(
+            "[WARN] 已启用本地 ntfy，但未找到 ntfy 可执行文件。"
+            f"可设置环境变量 {NTFY_EXE_ENV} 指定路径。"
+        )
+        return False
+
+    log_dir = Path(ROOT) / "log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "ntfy-server.log"
+        log_file = open(log_path, "a", encoding="utf-8")
+    except OSError as exc:
+        print(f"[WARN] 无法创建 ntfy 日志文件: {exc}")
+        return False
+
+    command = [
+        executable,
+        "serve",
+        "--listen-http", f":{port}",
+        "--base-url", server_url,
+    ]
+    popen_kwargs: dict = {
+        "cwd": str(Path(executable).parent),
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_file,
+        "stderr": subprocess.STDOUT,
+    }
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+    except OSError as exc:
+        print(f"[WARN] ntfy 服务启动失败: {exc}")
+        return False
+    finally:
+        # Popen duplicates/inherits the handle it needs; the launcher should not
+        # retain a descriptor for the lifetime of the detached server.
+        log_file.close()
+
+    deadline = time.monotonic() + max(wait_seconds, 0.0)
+    while time.monotonic() < deadline:
+        if _is_ntfy_healthy(port):
+            print(f"[OK] ntfy 服务已启动: {server_url} ({executable})")
+            return True
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    print(f"[WARN] ntfy 服务未能在 {wait_seconds:g} 秒内就绪，详见: {log_path}")
+    return False
+
+
+def _print_access_info(port: int):
+    """Print access URLs for both local and LAN."""
+    ip = get_local_ip()
+    print(f"  本机访问:   http://localhost:{port}")
+    print(f"  局域网访问: http://{ip}:{port}")
+    print()
+    print(f"  手机扫码:   打开上方页面 → 右上角设置 → 底部二维码")
+    print(f"  (手机和电脑需在同一 WiFi 下，音频在电脑端采集)")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Dependency checks
+# ---------------------------------------------------------------------------
+
+def _pip_install(packages: list[str]):
+    """Install packages using the *current* Python interpreter."""
+    print(f"[...] 正在安装: {' '.join(packages)}")
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", *packages]
+    )
+    return r.returncode == 0
+
+
+def ensure_python_deps():
+    """Make sure all backend Python dependencies are importable.
+
+    Strategy:
+    1. Try importing key packages. If they all work, do nothing.
+    2. If any is missing, run: pip install -r backend/requirements.txt
+       using *sys.executable* (same Python that is running this script).
+    3. After installing, re-check; exit with helpful message if still missing.
+    """
+    probe_packages = ["fastapi", "uvicorn", "openai", "numpy", "sounddevice"]
+    # Moonlight delivers its audio to the desktop's Windows output device.
+    # soundcard is the WASAPI loopback provider used to capture that output;
+    # probe it here so a clean desktop install does not silently fall back to
+    # microphone-only devices.
+    if platform.system() == "Windows":
+        probe_packages.append("soundcard")
+    missing = []
+    for pkg in probe_packages:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+
+    if not missing:
+        return  # all good
+
+    print(f"[WARN] 缺少 Python 依赖: {', '.join(missing)}")
+    print(f"[...] 尝试自动安装 backend/requirements.txt ...")
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-r", REQUIREMENTS, "--quiet"]
+    )
+    if r.returncode != 0:
+        _print_dep_help()
+        sys.exit(1)
+
+    # Re-check
+    still_missing = []
+    for pkg in probe_packages:
+        try:
+            __import__(pkg.replace("-", "_"))
+        except ImportError:
+            still_missing.append(pkg)
+    if still_missing:
+        print(f"\n[ERROR] 安装后仍缺少: {', '.join(still_missing)}")
+        _print_dep_help()
+        sys.exit(1)
+
+    print("[OK] 依赖安装完成")
+
+
+def _print_dep_help():
+    print()
+    print("  请手动安装后端依赖：")
+    print(f"    {sys.executable} -m pip install -r backend/requirements.txt")
+    print()
+    print("  如果你在使用虚拟环境，请先激活它：")
+    if platform.system() == "Windows":
+        print("    venv\\Scripts\\activate       # CMD")
+        print("    venv\\Scripts\\Activate.ps1   # PowerShell")
+    else:
+        print("    source venv/bin/activate")
+    print()
+    print("  也可以用 conda：")
+    print("    conda activate <your-env>")
+
+
+def _find_npx() -> Optional[str]:
+    """Return path to npx, or None if not found."""
+    return shutil.which("npx") or shutil.which("npx.cmd")
+
+
+def _find_npm() -> Optional[str]:
+    return shutil.which("npm") or shutil.which("npm.cmd")
+
+
+def _print_node_help():
+    system = platform.system()
+    print()
+    print("[ERROR] 未找到 Node.js / npm，桌面模式和前端构建需要 Node.js 18+。")
+    print()
+    if system == "Windows":
+        print("  安装方法（选一种）：")
+        print("  1. 官网下载安装包: https://nodejs.org （推荐 LTS 版）")
+        print("  2. winget: winget install OpenJS.NodeJS.LTS")
+        print("  3. 用 nvm-windows 管理多版本: https://github.com/coreybutler/nvm-windows")
+    elif system == "Darwin":
+        print("  安装方法（选一种）：")
+        print("  1. Homebrew: brew install node")
+        print("  2. 官网下载: https://nodejs.org")
+        print("  3. nvm: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/HEAD/install.sh | bash")
+        print("         nvm install --lts")
+    else:
+        print("  安装方法（选一种）：")
+        print("  1. 包管理器: sudo apt install nodejs npm  / sudo dnf install nodejs")
+        print("  2. nvm: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/HEAD/install.sh | bash")
+        print("          nvm install --lts")
+    print()
+    print("  安装后重新打开终端再运行本脚本。")
+    print()
+    print("  如果只想用网络模式（浏览器访问），可以先跳过桌面模式：")
+    print("    python start.py --mode network")
+
+
+# ---------------------------------------------------------------------------
+# Frontend build
+# ---------------------------------------------------------------------------
+
+def build_frontend(force: bool = False):
+    if not force and os.path.isdir(FRONTEND_DIST):
+        print("[OK] 前端已构建，跳过 (用 --rebuild 强制重新构建)")
+        return True
+
+    npm = _find_npm()
+    if npm is None:
+        _print_node_help()
+        return False
+
+    if force and os.path.isdir(FRONTEND_DIST):
+        print("[...] 清除旧构建产物...")
+        shutil.rmtree(FRONTEND_DIST, ignore_errors=True)
+
+    print("[...] 构建前端...")
+    if not os.path.isdir(os.path.join(FRONTEND_DIR, "node_modules")):
+        print("  安装前端 npm 依赖...")
+        r = subprocess.run([npm, "install"], cwd=FRONTEND_DIR, **_hidden_process_kwargs())
+        if r.returncode != 0:
+            print("[ERROR] npm install 失败")
+            return False
+    r = subprocess.run([npm, "run", "build"], cwd=FRONTEND_DIR, **_hidden_process_kwargs())
+    if r.returncode != 0:
+        print("[ERROR] 前端构建失败")
+        return False
+    print("[OK] 前端构建完成")
+    return True
+
+
+def ensure_electron():
+    """Make sure desktop/node_modules/electron exists."""
+    if os.path.isdir(os.path.join(DESKTOP_DIR, "node_modules", "electron")):
+        return True
+
+    npm = _find_npm()
+    if npm is None:
+        _print_node_help()
+        return False
+
+    print("[...] 安装 Electron 依赖...")
+    r = subprocess.run([npm, "install"], cwd=DESKTOP_DIR, **_hidden_process_kwargs())
+    return r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Port management
+# ---------------------------------------------------------------------------
+
+def kill_port(port: int):
+    """Kill any process occupying the given port."""
+    system = platform.system()
+    killed = False
+    try:
+        if system == "Windows":
+            result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace"
+            )
+            for line in result.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    pid = parts[-1]
+                    subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                    print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
+                    killed = True
+        else:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True, text=True
+            )
+            for pid in result.stdout.strip().split():
+                if pid:
+                    subprocess.run(["kill", "-9", pid], capture_output=True)
+                    print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
+                    killed = True
+    except Exception as e:
+        print(f"[WARN] 清理端口 {port} 时出错: {e}")
+    if killed:
+        time.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+
+def start_server(host: str, port: int):
+    kill_port(port)
+
+    # Add backend to sys.path so all relative imports work correctly
+    if BACKEND_DIR not in sys.path:
+        sys.path.insert(0, BACKEND_DIR)
+    os.chdir(BACKEND_DIR)
+
+    # Try direct import first (fastest, works when deps are in current env)
+    try:
+        import uvicorn
+        _access_log = os.environ.get("IA_ACCESS_LOG", "1").strip().lower() not in ("0", "false", "no")
+        uvicorn.run(
+            "main:app",
+            host=host,
+            port=port,
+            log_level="info",
+            reload=False,
+            access_log=_access_log,
+        )
+        return
+    except ImportError:
+        pass
+
+    # Fallback: subprocess using sys.executable (handles venv / conda / pyenv)
+    print("[INFO] uvicorn 不在当前 Python 路径，尝试通过 subprocess 启动...")
+    uv_args = [
+        sys.executable, "-m", "uvicorn",
+        "main:app",
+        "--host", host,
+        "--port", str(port),
+        "--log-level", "info",
+    ]
+    if os.environ.get("IA_ACCESS_LOG", "1").strip().lower() in ("0", "false", "no"):
+        uv_args.append("--no-access-log")
+    r = subprocess.run(uv_args, cwd=BACKEND_DIR, **_hidden_process_kwargs())
+    sys.exit(r.returncode)
+
+
+# ---------------------------------------------------------------------------
+# Run modes
+# ---------------------------------------------------------------------------
+
+def run_desktop_mode(port: int):
+    """Desktop mode: a normal visible Electron window with global hotkeys."""
+    npx = _find_npx()
+    if npx is None:
+        _print_node_help()
+        sys.exit(1)
+
+    if not ensure_electron():
+        print("[ERROR] Electron 安装失败，请检查网络后重试。")
+        print("  手动安装: cd desktop && npm install")
+        print()
+        print("  或者直接用无 Electron 模式启动:")
+        print(f"    python start.py --mode network")
+        sys.exit(1)
+
+    # Pre-clean the port BEFORE Electron launches (Electron spawns
+    # start.py --mode network internally, but if a zombie process holds
+    # the port, it would fail deep inside that chain with a confusing error).
+    kill_port(port)
+
+    # Windows: 如果当前进程还有控制台窗口，先以无窗口模式重启自己
+    # 这样用户双击启动时，初始的命令行窗口会消失，只留 Electron 窗口
+    if platform.system() == "Windows" and os.environ.get(HIDE_CONSOLE_ENV) != "1":
+        print("  Electron 桌面模式")
+        print("  - 双机位可见模式: 已开启")
+        print("  - 全局快捷键: Ctrl+B 显示/隐藏")
+        print("  - 系统托盘: 右键显示、置顶或退出")
+        print()
+        _print_access_info(port)
+        print()
+        print("  正在启动桌面应用...")
+        import time
+        time.sleep(1)  # 给用户 1 秒看到消息
+
+        # 重启自己，但这次带上隐藏标志
+        env = {**os.environ, HIDE_CONSOLE_ENV: "1"}
+        subprocess.Popen(
+            [sys.executable] + sys.argv,
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            cwd=os.getcwd(),
+        )
+        sys.exit(0)
+
+    # 到这里说明已经是无窗口模式了（或者不是 Windows）
+    env = {**os.environ, "PORT": str(port), HIDE_CONSOLE_ENV: "1"}
+    proc = subprocess.run([npx, "electron", "."], cwd=DESKTOP_DIR, env=env, **_hidden_process_kwargs())
+    sys.exit(proc.returncode)
+
+
+def run_network_mode(port: int):
+    """Network mode: LAN accessible via browser (no Electron needed)."""
+    os.environ.setdefault("IA_AUTH_ENABLE", "1")
+    print("  纯浏览器模式（无 Electron）")
+    print()
+    _print_access_info(port)
+
+    ensure_local_ntfy_server()
+    start_server("0.0.0.0", port)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    # Switch console to UTF-8 immediately on Windows (before any print)
+    _set_utf8_console()
+
+    parser = argparse.ArgumentParser(description="面试助手启动器")
+    parser.add_argument("--mode", choices=["desktop", "network"], default="desktop",
+                        help="运行模式: desktop (Electron 桌面窗口) 或 network (局域网浏览器访问)")
+    parser.add_argument("--port", type=int, default=18080, help="服务端口 (默认 18080)")
+    parser.add_argument("--no-build", action="store_true", help="跳过前端构建")
+    parser.add_argument("--rebuild", action="store_true", help="强制重新构建前端（即使 dist 已存在）")
+    parser.add_argument("--skip-dep-check", action="store_true",
+                        help="跳过 Python 依赖检查（已确认环境正确时可加速启动）")
+    args = parser.parse_args()
+
+    print("=" * 50)
+    print("  面试学习助手")
+    print("=" * 50)
+    print()
+
+    # Python 版本检查
+    if sys.version_info < (3, 10):
+        print(f"[ERROR] 需要 Python 3.10+，当前版本: {sys.version}")
+        print("  请升级 Python: https://www.python.org/downloads/")
+        sys.exit(1)
+
+    print(f"  Python: {sys.version.split()[0]}  ({sys.executable})")
+    print(f"  平台: {platform.system()} {platform.machine()}")
+    print()
+
+    # Ensure Python deps (auto-install if missing)
+    if not args.skip_dep_check:
+        ensure_python_deps()
+
+    if not args.no_build:
+        if not build_frontend(force=args.rebuild):
+            print()
+            print("  前端构建失败，可以用 --no-build 跳过（需先手动构建）：")
+            print(f"    cd frontend && npm install && npm run build && cd ..")
+            print(f"    python start.py --no-build")
+            sys.exit(1)
+
+    mode_label = "Electron 桌面窗口" if args.mode == "desktop" else "局域网浏览器"
+    print(f"  模式: {mode_label}  端口: {args.port}")
+    print("=" * 50)
+    print()
+
+    if args.mode == "desktop":
+        run_desktop_mode(args.port)
+    else:
+        run_network_mode(args.port)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n  已停止。")
+        sys.exit(0)
