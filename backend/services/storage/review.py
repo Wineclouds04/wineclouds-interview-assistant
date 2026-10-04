@@ -8,6 +8,10 @@ import time
 from typing import Any, Optional
 
 from services.storage.paths import sqlite_path
+from services.storage.db import connect
+from core.logger import get_logger
+
+_log = get_logger("storage.review")
 
 DB_PATH = sqlite_path("review.db")
 _db_lock = threading.Lock()
@@ -76,10 +80,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return connect(DB_PATH)
 
 
 def init_db() -> None:
@@ -156,7 +157,8 @@ def init_db() -> None:
             _ensure_column(conn, "review_sessions", "application_id", "INTEGER")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_review_sessions_application_id ON review_sessions(application_id)")
         except Exception:
-            pass
+            # Schema upgrade failed: later queries on these columns will fail too.
+            _log.error("review.db schema migration failed", exc_info=True)
         conn.commit()
         conn.close()
 
@@ -609,7 +611,10 @@ def _application_brief(application_id: Any) -> Optional[dict[str, Any]]:
         from services.storage import job_tracker
 
         app = job_tracker.get_application(int(application_id))
+    except (TypeError, ValueError):
+        return None
     except Exception:
+        _log.warning("Failed to load linked job application", exc_info=True)
         return None
     if not app:
         return None
@@ -763,7 +768,10 @@ def sync_application_todos_for_session(session_id: int) -> bool:
         from services.storage import job_tracker
 
         app = job_tracker.get_application(application_id)
+    except (TypeError, ValueError):
+        return False
     except Exception:
+        _log.warning("Failed to load linked job application", exc_info=True)
         return False
     if not app:
         return False
@@ -797,7 +805,10 @@ def sync_application_link_metadata_for_session(session_id: int) -> bool:
         from services.storage import job_tracker
 
         app = job_tracker.get_application(int(detail["application_id"]))
+    except (TypeError, ValueError):
+        return False
     except Exception:
+        _log.warning("Failed to load linked job application", exc_info=True)
         return False
     if not app:
         return False
@@ -847,7 +858,10 @@ def sync_review_metadata_from_application(application_id: int) -> int:
         from services.storage import job_tracker
 
         app = job_tracker.get_application(int(application_id))
+    except (TypeError, ValueError):
+        return 0
     except Exception:
+        _log.warning("Failed to load linked job application", exc_info=True)
         return 0
     if not app:
         return 0
@@ -884,7 +898,10 @@ def _remove_review_todos_from_application(session_id: int, application_id: int) 
         from services.storage import job_tracker
 
         app = job_tracker.get_application(int(application_id))
+    except (TypeError, ValueError):
+        return False
     except Exception:
+        _log.warning("Failed to load linked job application", exc_info=True)
         return False
     if not app:
         return False

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import threading
+from copy import deepcopy
 from typing import Iterable, List, Sequence
 
 from core.logger import get_logger
@@ -90,9 +91,11 @@ def summarize_messages(messages: Sequence[dict], prior_summary: str = "") -> str
     if usage:
         _add_tokens(usage.prompt_tokens or 0, usage.completion_tokens or 0)
     if not response.choices:
-        return prior_summary or ""
+        raise ValueError("Memory summary response has no choices")
     text = (response.choices[0].message.content or "").strip()
-    return text or (prior_summary or "")
+    if not text:
+        raise ValueError("Memory summary response is empty")
+    return text
 
 
 def schedule_compaction(target_session) -> None:
@@ -115,24 +118,28 @@ def schedule_compaction(target_session) -> None:
         if len(history) <= keep:
             return
         snapshot_len = len(history) - keep
-        snapshot = list(history[:snapshot_len])
+        snapshot = deepcopy(history[:snapshot_len])
         prior = target_session.system_summary or ""
+        epoch = getattr(target_session, "_conversation_epoch", 0)
         target_session._compaction_running = True
 
     def _worker() -> None:
-        new_summary: str
         try:
             new_summary = summarize_messages(snapshot, prior)
-        except Exception as e:  # noqa: BLE001
-            _log.warning("memory compaction failed, keep prior summary: %s", e)
-            new_summary = prior
-        with conversation_lock:
-            try:
-                # 仅在历史仍包含我们 snapshot 的部分时,才裁掉相应数量
-                if len(target_session.conversation_history) >= snapshot_len:
-                    target_session.conversation_history = target_session.conversation_history[snapshot_len:]
+            if not new_summary or not new_summary.strip():
+                return
+            with conversation_lock:
+                if getattr(target_session, "_conversation_epoch", 0) != epoch:
+                    return
+                if target_session.conversation_history[:snapshot_len] != snapshot:
+                    return
+                target_session.conversation_history = target_session.conversation_history[snapshot_len:]
                 target_session.system_summary = new_summary
-            finally:
-                target_session._compaction_running = False
+        except Exception as e:  # noqa: BLE001
+            _log.warning("memory compaction failed, keep original history: %s", e)
+        finally:
+            with conversation_lock:
+                if getattr(target_session, "_conversation_epoch", 0) == epoch:
+                    target_session._compaction_running = False
 
     threading.Thread(target=_worker, name="memory-compactor", daemon=True).start()

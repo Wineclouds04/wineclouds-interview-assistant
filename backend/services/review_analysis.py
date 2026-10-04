@@ -18,6 +18,33 @@ from services.llm.streaming import (
 
 logger = get_logger(__name__)
 
+
+class ReviewAnalysisError(RuntimeError):
+    """Analysis failed; callers must keep the review retryable."""
+
+
+def is_successful_turn_analysis(turn: dict) -> bool:
+    strengths = turn.get("strengths") or []
+    risks = turn.get("risks") or []
+    scorecard = turn.get("scorecard") or {}
+    return (
+        turn.get("analysis_status", "completed") == "completed"
+        and isinstance(strengths, list)
+        and isinstance(risks, list)
+        and isinstance(scorecard, dict)
+        and all(isinstance(item, str) for item in strengths + risks)
+        and not any(item.startswith(("分析失败:", "分析失败：")) for item in risks)
+        and bool(strengths or risks or scorecard)
+    )
+
+
+def is_successful_summary(summary: Any) -> bool:
+    return (
+        isinstance(summary, str)
+        and bool(summary.strip())
+        and not summary.strip().startswith(("## 总结生成失败", "未配置有效的模型 API Key"))
+    )
+
 DEFAULT_ASR_CORRECTION_SAMPLE = (
     "我做过 red 地址缓存，麦 SQL 查询会先看布隆过绿器，"
     "如果空只命中就直接返回，避免打到数据库。"
@@ -216,16 +243,7 @@ def analyze_turn(
         client, model_name = get_active_llm_client()
     except ValueError as e:
         logger.warning("Failed to get active LLM client: %s", e)
-        return {
-            "strengths": [],
-            "risks": [],
-            "scorecard": {},
-            "evidence": {
-                **({"review_mode": "written_exam"} if is_written_exam else {}),
-                **correction_evidence,
-            },
-            "corrected_answer": corrected_answer if corrected_answer != candidate_answer else None,
-        }
+        raise ReviewAnalysisError("复盘模型未配置有效的 API Key") from e
 
     if is_written_exam:
         prompt = f"""你是一位资深算法与笔试辅导教练，请对一次截图笔试答题结果进行客观复盘。
@@ -380,16 +398,7 @@ def analyze_turn(
 
     except Exception as e:
         logger.error("Failed to analyze turn: %s", e, exc_info=True)
-        return {
-            "strengths": [],
-            "risks": [f"分析失败: {str(e)[:50]}"],
-            "scorecard": {},
-            "evidence": {
-                **({"review_mode": "written_exam"} if is_written_exam else {}),
-                **correction_evidence,
-            },
-            "corrected_answer": corrected_answer if corrected_answer != candidate_answer else None,
-        }
+        raise ReviewAnalysisError("逐题分析失败，请检查模型配置后重试") from e
 
 
 def generate_summary(
@@ -417,11 +426,7 @@ def generate_summary(
         client, model_name = get_active_llm_client()
     except ValueError as e:
         logger.warning("Failed to get active LLM client: %s", e)
-        return {
-            "summary_markdown": "未配置有效的模型 API Key，无法生成总结",
-            "strong_points": [],
-            "weak_points": [],
-        }
+        raise ReviewAnalysisError("复盘模型未配置有效的 API Key") from e
 
     # 构建输入
     turns_text = ""
@@ -530,6 +535,8 @@ def generate_summary(
 
         result = json.loads(json_str)
 
+        if not is_successful_summary(result.get("summary_markdown")):
+            raise ValueError("Empty or invalid review summary")
         return {
             "summary_markdown": result.get("summary_markdown", ""),
             "strong_points": result.get("strong_points", []),
@@ -538,8 +545,4 @@ def generate_summary(
 
     except Exception as e:
         logger.error("Failed to generate summary: %s", e, exc_info=True)
-        return {
-            "summary_markdown": f"## 总结生成失败\n\n{str(e)}",
-            "strong_points": [],
-            "weak_points": [],
-        }
+        raise ReviewAnalysisError("总结生成失败，请检查模型配置后重试") from e

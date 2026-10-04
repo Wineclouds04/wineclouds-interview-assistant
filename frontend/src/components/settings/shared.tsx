@@ -227,6 +227,8 @@ export function useAutoSaveSetting<T extends Record<string, unknown>>(
       clearTimer()
       pendingRef.current = null
       if (pending) {
+        // Intentionally the latest sequence at unmount time, not the value at mount.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
         void runQueuedSave(pending, sequenceRef.current, false)
       }
     }

@@ -14,14 +14,12 @@ from core.auth import (
     get_token,
     init_auth,
     is_auth_disabled,
-    is_loopback_host,
     loopback_bypass_allowed,
-    origin_allows_loopback_bypass,
     verify_token,
 )
-from core.config import get_config
+from core.config import ConfigSaveError, get_config
 from core.env import env_int
-from core.logger import setup_logging, get_logger
+from core.logger import setup_logging, get_logger, RedactTokenFilter
 from services.stt import get_stt_engine
 from api.realtime import ws
 from api import common, assist, analytics, resume, jobs, review
@@ -56,13 +54,27 @@ class _SuppressStealthScreenAccessLog(logging.Filter):
         return "ask-from-server-screen" not in msg
 
 
+_RedactTokenAccessLog = RedactTokenFilter
+
+
+def _install_token_log_filters() -> None:
+    # Uvicorn logs WebSocket handshakes through uvicorn.error. Filtering the
+    # parent handlers also covers records emitted by protocol child loggers.
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        logger = logging.getLogger(name)
+        for target in (logger, *logger.handlers):
+            if not any(isinstance(f, RedactTokenFilter) for f in target.filters):
+                target.addFilter(RedactTokenFilter())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.getLogger("uvicorn.access").addFilter(_SuppressStealthScreenAccessLog())
+    _install_token_log_filters()
 
     token = init_auth()
     if is_auth_disabled():
-        _log.info("AUTH disabled (set IA_AUTH_ENABLE=1 or IA_AUTH_TOKEN to protect LAN access)")
+        _log.warning("AUTH disabled by IA_AUTH_DISABLE=1: LAN clients can access the API without a token")
     else:
         _log.info(
             "AUTH ready (loopback bypass; LAN clients must include token; len=%d)",
@@ -125,6 +137,11 @@ def _preload_stt():
 
 app = FastAPI(title="学习助手", lifespan=lifespan)
 
+
+@app.exception_handler(ConfigSaveError)
+async def config_save_error_handler(request: Request, exc: ConfigSaveError):
+    return JSONResponse({"detail": str(exc)}, status_code=503)
+
 # CORS: 默认只允许后端自身的 loopback origin。局域网扫码页面与桌面端均为同源访问,
 # 不需要跨源；如确需单独前端直连后端，可通过 IA_CORS_REGEX 显式放宽。
 # 「allow_credentials=True」与「allow_origins=['*']」并存会被浏览器拒绝。
@@ -186,15 +203,6 @@ def _request_needs_auth(path: str) -> bool:
     return False
 
 
-def _origin_allows_loopback_bypass(request: Request) -> bool:
-    return origin_allows_loopback_bypass(
-        request.headers.get("origin"),
-        request.url.hostname,
-        request.url.scheme,
-        request.url.port,
-    )
-
-
 @app.middleware("http")
 async def lan_auth_middleware(request: Request, call_next):
     if is_auth_disabled():
@@ -212,12 +220,10 @@ async def lan_auth_middleware(request: Request, call_next):
     ):
         return await call_next(request)
     token = extract_token_from_headers(request.headers.get("authorization"))
-    if not token:
-        token = request.query_params.get("token")
     if verify_token(token):
         return await call_next(request)
     return JSONResponse(
-        {"detail": "未授权:LAN 访问需要在请求头 Authorization: Bearer 或 ?token= 中携带令牌。"},
+        {"detail": "未授权:LAN 访问需要在请求头 Authorization: Bearer 中携带令牌。"},
         status_code=401,
     )
 
@@ -228,7 +234,14 @@ async def api_auth_info(request: Request):
     client_host = request.client.host if request.client else None
     if is_auth_disabled():
         return {"required": False, "token": None}
-    if not is_loopback_host(client_host):
+    # 同样要求 Host / Origin 是环回同源,否则 DNS rebinding 页面可以读走 token。
+    if not loopback_bypass_allowed(
+        client_host,
+        request.headers.get("origin"),
+        request.url.hostname,
+        request.url.scheme,
+        request.url.port,
+    ):
         return JSONResponse(
             {"detail": "auth/info 仅允许环回访问,LAN 端请扫码获取带 token 的 URL。"},
             status_code=403,

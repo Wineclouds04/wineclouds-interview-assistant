@@ -123,6 +123,9 @@ class ConfigUpdate(BaseModel):
 
 _MODEL_API_KEY_KEEP = "__IA_KEEP_EXISTING_API_KEY__"
 _NTFY_TOKEN_KEEP = "__IA_KEEP_EXISTING_NTFY_TOKEN__"
+# GET /config 不回显 STT 凭证;前端留空保存时发送该占位符,表示保持原值。
+_STT_SECRET_KEEP = "__IA_KEEP_EXISTING_SECRET__"
+_STT_SECRET_FIELDS = ("doubao_stt_access_token", "doubao_stt_api_key", "generic_stt_api_key")
 
 
 class ModelListRequest(BaseModel):
@@ -272,13 +275,16 @@ async def api_get_models_full():
 
 @router.post("/config")
 async def api_update_config(body: ConfigUpdate):
-    from core.config import ModelConfig
+    from core.config import ConfigSaveError, ModelConfig, ensure_secrets_available
 
     d = body.model_dump(exclude_none=True)
     try:
-        current_config = get_config()
+        current_config = ensure_secrets_available()
         if d.get("ntfy_token") == _NTFY_TOKEN_KEEP:
             d["ntfy_token"] = getattr(current_config, "ntfy_token", "")
+        for key in _STT_SECRET_FIELDS:
+            if d.get(key) == _STT_SECRET_KEEP:
+                d[key] = getattr(current_config, key, "")
         for key in ("ntfy_server_url", "ntfy_topic", "ntfy_token"):
             if key in d:
                 d[key] = str(d[key]).strip()
@@ -447,6 +453,8 @@ async def api_update_config(body: ConfigUpdate):
         await run_in_threadpool(update_config, d)
     except HTTPException:
         raise
+    except ConfigSaveError as e:
+        raise HTTPException(503, str(e)) from e
     except (TypeError, ValueError, ValidationError) as e:
         raise HTTPException(400, str(e)) from e
     if body.whisper_language is not None:
@@ -481,7 +489,7 @@ async def api_ntfy_test():
 async def api_network_info(request: Request):
     """Return LAN IP and port so the frontend can render a scannable QR code.
 
-    若 LAN 鉴权开启,环回访问会在 URL 中追加 ``?t=<token>``,扫码后手机端
+    若 LAN 鉴权开启,环回访问会在 URL 中追加 ``#t=<token>``,扫码后手机端
     可自动写入 sessionStorage 并附在后续请求里。LAN 客户端拿到的是不带
     token 的 URL,自身就拒绝访问,从而避免凭证泄露。
     """
@@ -500,7 +508,8 @@ async def api_network_info(request: Request):
     url = base
     auth_required = not is_auth_disabled()
     if auth_required and is_loopback_host(client_host):
-        url = f"{base}/?t={get_token()}"
+        # token 放在 fragment(#t=)里:浏览器不会把 fragment 发给服务器,也就不会进入访问日志。
+        url = f"{base}/#t={get_token()}"
     return {
         "ip": ip,
         "port": port,
@@ -740,7 +749,9 @@ async def api_token_stats():
 @router.post("/config/models-layout")
 async def api_models_layout(body: dict):
     """调整模型顺序、开关与并行路数，不丢失各模型 api_key。"""
-    cfg = get_config()
+    from core.config import ensure_secrets_available
+
+    cfg = ensure_secrets_available()
     order = body.get("order")
     if order is not None and isinstance(order, list):
         models = []

@@ -17,12 +17,14 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from core.config import get_config
 from core.resource_lanes import ResourceLaneBusyError, run_low_priority
 from services.kb import indexer, retriever
 from services.kb.recent_hits import global_recent_hits
+from services.kb.paths import resolve_kb_file_path, safe_relative_path
 
 router = APIRouter()
 
@@ -120,16 +122,14 @@ def _safe_rel_path(subdir: str, filename: str, allowed_exts: set[str]) -> Path:
     if "/" in name or "\\" in name:
         raise HTTPException(status_code=400, detail="filename must not contain path separators")
 
-    sub = (subdir or "").strip().strip("/").strip("\\")
-    if sub:
-        if any(p in ("..", "") for p in Path(sub).parts) or Path(sub).is_absolute():
-            raise HTTPException(status_code=400, detail="path traversal detected")
-        rel = Path(sub) / name
-    else:
-        rel = Path(name)
-
-    if any(p in ("..", "") for p in rel.parts) or rel.is_absolute():
-        raise HTTPException(status_code=400, detail="path traversal detected")
+    sub = (subdir or "").strip()
+    try:
+        if sub:
+            safe_relative_path(sub)
+        safe_relative_path(name)
+        rel = safe_relative_path(f"{sub}/{name}" if sub else name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="path traversal detected") from e
 
     ext = rel.suffix.lower()
     if ext == ".doc":
@@ -140,6 +140,13 @@ def _safe_rel_path(subdir: str, filename: str, allowed_exts: set[str]) -> Path:
     if ext not in allowed_exts:
         raise HTTPException(status_code=415, detail=f"扩展名 {ext} 不在白名单内")
     return rel
+
+
+def _write_kb_upload(kb_dir: Path, rel: Path, content: bytes) -> None:
+    dest = resolve_kb_file_path(kb_dir, rel)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Validate again after creating parents, including any existing symlinks.
+    resolve_kb_file_path(kb_dir, rel).write_bytes(content)
 
 
 @router.post("/kb/upload")
@@ -157,9 +164,10 @@ async def kb_upload(
         raise HTTPException(status_code=413, detail=f"文件超过限额 {max_bytes} bytes")
 
     kb_dir = Path(indexer.resolve_path(getattr(cfg, "kb_dir", "data/kb")))
-    dest = kb_dir / rel
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(content)
+    try:
+        await run_in_threadpool(_write_kb_upload, kb_dir, rel, content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="path traversal detected") from e
 
     rel_str = str(rel).replace("\\", "/")
     info = await _run_kb_low_priority(indexer.reindex_file, rel_str)
@@ -185,7 +193,9 @@ async def kb_delete_doc(path: str) -> dict:
     p = (path or "").strip()
     if not p:
         raise HTTPException(status_code=400, detail="path required")
-    if Path(p).is_absolute() or any(part in ("..",) for part in Path(p).parts):
-        raise HTTPException(status_code=400, detail="invalid path")
-    await _run_kb_low_priority(indexer.remove_file, p)
+    try:
+        p = str(safe_relative_path(p)).replace("\\", "/")
+        await _run_kb_low_priority(indexer.remove_file, p)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="invalid path") from e
     return {"ok": True, "path": p}

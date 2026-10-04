@@ -1,7 +1,5 @@
 const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen } = require('electron');
-const { spawn } = require('child_process');
 const path = require('path');
-const http = require('http');
 const fs = require('fs');
 
 // 默认使用普通可见窗口，适合双机位/双显示器学习场景。旧的内容保护、
@@ -40,9 +38,9 @@ const {
 const {
   createOverlayChromeOptions,
   getPromptOverlayInitialWidth,
-  relayChildOutput,
 } = require('./windowOptions');
 const { createMultiScreenBatch } = require('./multiScreenBatch');
+const { createBackend } = require('./backendProcess');
 
 const pkg = require('./package.json');
 
@@ -84,12 +82,25 @@ const APP_ICON_PATH = path.join(
 const ROOT = path.resolve(__dirname, '..');
 const BACKEND_DIR = path.join(ROOT, 'backend');
 const PORT = parseInt(process.env.PORT || '18080', 10);
-const SERVER_URL = `http://127.0.0.1:${PORT}`;
+const backend = createBackend({
+  root: ROOT,
+  port: PORT,
+  isQuitting: () => isQuitting,
+  onUnexpectedExit: (code) => {
+    if (mainWindow) {
+      const { dialog } = require('electron');
+      dialog.showErrorBox('后端已退出', `Python 后端进程异常退出 (code ${code})。\n可能原因：端口 ${PORT} 被占用。\n请关闭占用该端口的进程后重试。`);
+    }
+    app.quit();
+  },
+});
+const SERVER_URL = backend.serverUrl;
+const postBackend = backend.post;
+const getBackend = backend.get;
 
 let mainWindow = null;
 let overlayWindow = null;
 let tray = null;
-let pythonProcess = null;
 let isQuitting = false;
 let shortcuts = {};
 let previousQuestionShortcutBusy = false;
@@ -297,54 +308,6 @@ function createTrayIcon() {
   return canvas;
 }
 
-function waitForServer(timeout = 40000) {
-  const start = Date.now();
-  return new Promise((resolve, reject) => {
-    const check = () => {
-      const req = http.get(`${SERVER_URL}/api/options`, { timeout: 1000 }, (res) => {
-        if (res.statusCode === 200) return resolve();
-        retry();
-      });
-      req.on('error', retry);
-      req.on('timeout', () => { req.destroy(); retry(); });
-    };
-    const retry = () => {
-      if (Date.now() - start > timeout) return reject(new Error('Server start timeout'));
-      setTimeout(check, 300);
-    };
-    check();
-  });
-}
-
-function startPythonBackend() {
-  const python = process.platform === 'win32' ? 'python' : 'python3';
-  pythonProcess = spawn(python, [
-    path.join(ROOT, 'start.py'),
-    '--mode', 'network',
-    '--no-build',
-    '--port', String(PORT),
-  ], {
-    cwd: ROOT,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
-    windowsHide: true,
-  });
-
-  relayChildOutput(pythonProcess.stdout, process.stdout, '[py] ');
-  relayChildOutput(pythonProcess.stderr, process.stderr, '[py] ');
-  pythonProcess.on('close', (code) => {
-    console.log(`[py] exited with code ${code}`);
-    pythonProcess = null;
-    if (!isQuitting) {
-      if (mainWindow) {
-        const { dialog } = require('electron');
-        dialog.showErrorBox('后端已退出', `Python 后端进程异常退出 (code ${code})。\n可能原因：端口 ${PORT} 被占用。\n请关闭占用该端口的进程后重试。`);
-      }
-      app.quit();
-    }
-  });
-}
-
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -543,57 +506,6 @@ function toggleWindow() {
     mainWindow.show();
     mainWindow.focus();
   }
-}
-
-function postBackend(pathname, body = '{}') {
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      `${SERVER_URL}${pathname}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      },
-      (res) => {
-        let raw = '';
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => { raw += chunk; });
-        res.on('end', () => {
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            if (!raw) { resolve({ ok: true }); return; }
-            try { resolve(JSON.parse(raw)); } catch { resolve({ ok: true }); }
-            return;
-          }
-          reject(new Error(raw || res.statusMessage || `HTTP ${res.statusCode}`));
-        });
-      }
-    );
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-function getBackend(pathname) {
-  return new Promise((resolve, reject) => {
-    const req = http.request(`${SERVER_URL}${pathname}`, { method: 'GET' }, (res) => {
-      let raw = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk) => { raw += chunk; });
-      res.on('end', () => {
-        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-          if (!raw) { resolve({}); return; }
-          try { resolve(JSON.parse(raw)); } catch { resolve({}); }
-          return;
-        }
-        reject(new Error(raw || res.statusMessage || `HTTP ${res.statusCode}`));
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
 }
 
 async function getMultiScreenIdleMs() {
@@ -1090,71 +1002,11 @@ function createAppMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-function requestAssistStop(timeoutMs = 12000) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    };
-    const req = http.request(`${SERVER_URL}/api/stop`, {
-      method: 'POST',
-      timeout: timeoutMs,
-    }, (res) => {
-      res.resume();
-      res.on('end', finish);
-      res.on('close', finish);
-    });
-    req.on('error', finish);
-    req.on('timeout', () => {
-      try { req.destroy(); } catch (_) { /* ignore */ }
-      finish();
-    });
-    req.end();
-  });
-}
-
-// 优雅停止后端：先主动请求 assist stop，让复盘归档和 SQLite 刷盘完成；
-// 再发 SIGTERM，超时后兜底 SIGKILL。
-let pythonStopPromise = null;
-function gracefulStopPython(timeoutMs = 20000) {
-  if (pythonStopPromise) return pythonStopPromise;
-  const proc = pythonProcess;
-  if (!proc) return Promise.resolve();
-  pythonStopPromise = new Promise((resolve) => {
-    let settled = false;
-    const finish = () => { if (settled) return; settled = true; resolve(); };
-    proc.once('exit', finish);
-    const stopTimeoutMs = Math.max(1000, Math.min(15000, timeoutMs - 5000));
-    requestAssistStop(stopTimeoutMs).then(() => {
-      if (settled) return;
-      try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
-      setTimeout(() => {
-        if (settled) return;
-        try {
-          if (!proc.killed) {
-            console.warn('[py] graceful timeout, escalating to SIGKILL');
-            proc.kill('SIGKILL');
-          }
-        } catch (err) {
-          console.warn('[py] SIGKILL failed:', err.message);
-        }
-        finish();
-      }, Math.max(1000, timeoutMs - stopTimeoutMs));
-    });
-  });
-  return pythonStopPromise;
-}
-
 app.on('before-quit', (event) => {
   isQuitting = true;
-  if (!pythonProcess || pythonStopPromise) return;
+  if (!backend.isRunning() || backend.isStopping()) return;
   event.preventDefault();
-  gracefulStopPython().then(() => {
-    pythonProcess = null;
-    app.quit();
-  });
+  backend.gracefulStop().then(() => app.quit());
 });
 
 app.whenReady().then(async () => {
@@ -1165,10 +1017,10 @@ app.whenReady().then(async () => {
   }
   createAppMenu();
   console.log('Starting Python backend...');
-  startPythonBackend();
+  backend.start();
 
   try {
-    await waitForServer();
+    await backend.waitForServer();
     console.log('Backend ready, creating window...');
   } catch (err) {
     console.error('Failed to start backend:', err.message);
@@ -1211,8 +1063,5 @@ app.on('will-quit', () => {
   }
   // 兜底:before-quit 通常已经 graceful 停过 pythonProcess,
   // 这里 fallback 防止异常路径泄漏子进程。
-  if (pythonProcess) {
-    try { pythonProcess.kill('SIGKILL'); } catch (_) { /* ignore */ }
-    pythonProcess = null;
-  }
+  backend.killNow();
 });

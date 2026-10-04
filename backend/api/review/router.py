@@ -2,6 +2,7 @@ import re
 import time
 
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from services.storage import review
@@ -74,14 +75,12 @@ def _parse_manual_turns(transcript: str) -> list[dict[str, str]]:
 
 
 def _has_generated_analysis(detail: dict) -> bool:
-    if detail.get("summary_markdown") or detail.get("avg_score") is not None:
-        return True
-    for turn in detail.get("turns", []):
-        if turn.get("analysis_status") == "completed" and (
-            turn.get("strengths") or turn.get("risks") or turn.get("scorecard")
-        ):
-            return True
-    return False
+    if not review_analysis.is_successful_summary(detail.get("summary_markdown")):
+        return False
+    return all(
+        turn.get("is_partial") or review_analysis.is_successful_turn_analysis(turn)
+        for turn in detail.get("turns", [])
+    )
 
 
 @router.get("/review/sessions")
@@ -171,7 +170,8 @@ async def update_session(session_id: int, req: UpdateSessionRequest):
 @router.post("/review/asr-correction-test")
 async def test_asr_correction(req: AsrCorrectionTestRequest):
     """测试当前复盘模型是否可用于 ASR 纠错。"""
-    return review_analysis.run_asr_correction_check(
+    return await run_in_threadpool(
+        review_analysis.run_asr_correction_check,
         question=req.question or "请介绍一下你做过的缓存优化。",
         candidate_answer=req.answer or "",
     )

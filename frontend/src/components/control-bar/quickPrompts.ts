@@ -42,7 +42,9 @@ export function getQuickPrompts(): string[] {
       const sanitized = sanitizeQuickPrompts(parsed)
       if (sanitized.length > 0) return sanitized
     }
-  } catch {}
+  } catch {
+    /* storage unavailable or corrupt: fall back to defaults */
+  }
   return DEFAULT_QUICK_PROMPTS
 }
 
@@ -68,7 +70,9 @@ export function readQuickPromptRecent(): Record<string, number> {
           .slice(0, RECENT_MAX),
       )
     }
-  } catch {}
+  } catch {
+    /* storage unavailable or corrupt */
+  }
   return {}
 }
 
@@ -84,12 +88,16 @@ export function bumpQuickPromptRecent(prompt: string): Record<string, number> {
     const kept = Object.fromEntries(entries.slice(0, RECENT_MAX))
     try {
       localStorage.setItem(RECENT_KEY, JSON.stringify(kept))
-    } catch {}
+    } catch {
+      /* storage full or unavailable: keep in-memory value */
+    }
     return kept
   }
   try {
     localStorage.setItem(RECENT_KEY, JSON.stringify(current))
-  } catch {}
+  } catch {
+    /* storage full or unavailable: keep in-memory value */
+  }
   return current
 }
 

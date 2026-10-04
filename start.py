@@ -11,7 +11,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -67,7 +66,7 @@ def get_local_ip() -> str:
 # Local ntfy server
 # ---------------------------------------------------------------------------
 
-def _load_local_ntfy_settings() -> Optional[tuple[str, int]]:
+def _load_local_ntfy_settings() -> tuple[str, int] | None:
     """Return the configured local ntfy base URL and port when autostart applies."""
     try:
         with open(NTFY_CONFIG, "r", encoding="utf-8") as config_file:
@@ -102,7 +101,7 @@ def _load_local_ntfy_settings() -> Optional[tuple[str, int]]:
     return server_url, port
 
 
-def _find_ntfy_executable() -> Optional[str]:
+def _find_ntfy_executable() -> str | None:
     """Find a local ntfy binary without requiring it to be on PATH."""
     candidates: list[Path] = []
     configured = os.environ.get(NTFY_EXE_ENV, "").strip()
@@ -240,8 +239,8 @@ def _print_access_info(port: int):
     print(f"  本机访问:   http://localhost:{port}")
     print(f"  局域网访问: http://{ip}:{port}")
     print()
-    print(f"  手机扫码:   打开上方页面 → 右上角设置 → 底部二维码")
-    print(f"  (手机和电脑需在同一 WiFi 下，音频在电脑端采集)")
+    print("  手机扫码:   打开上方页面 → 右上角设置 → 底部二维码")
+    print("  (手机和电脑需在同一 WiFi 下，音频在电脑端采集)")
     print()
 
 
@@ -285,7 +284,7 @@ def ensure_python_deps():
         return  # all good
 
     print(f"[WARN] 缺少 Python 依赖: {', '.join(missing)}")
-    print(f"[...] 尝试自动安装 backend/requirements.txt ...")
+    print("[...] 尝试自动安装 backend/requirements.txt ...")
     r = subprocess.run(
         [sys.executable, "-m", "pip", "install", "-r", REQUIREMENTS, "--quiet"]
     )
@@ -324,12 +323,12 @@ def _print_dep_help():
     print("    conda activate <your-env>")
 
 
-def _find_npx() -> Optional[str]:
+def _find_npx() -> str | None:
     """Return path to npx, or None if not found."""
     return shutil.which("npx") or shutil.which("npx.cmd")
 
 
-def _find_npm() -> Optional[str]:
+def _find_npm() -> str | None:
     return shutil.which("npm") or shutil.which("npm.cmd")
 
 
@@ -451,6 +450,8 @@ def kill_port(port: int):
 # ---------------------------------------------------------------------------
 
 def start_server(host: str, port: int):
+    # Network info / QR URLs and CORS must use the same port as Uvicorn.
+    os.environ["PORT"] = str(port)
     kill_port(port)
 
     # Add backend to sys.path so all relative imports work correctly
@@ -505,7 +506,7 @@ def run_desktop_mode(port: int):
         print("  手动安装: cd desktop && npm install")
         print()
         print("  或者直接用无 Electron 模式启动:")
-        print(f"    python start.py --mode network")
+        print("    python start.py --mode network")
         sys.exit(1)
 
     # Pre-clean the port BEFORE Electron launches (Electron spawns
@@ -545,7 +546,6 @@ def run_desktop_mode(port: int):
 
 def run_network_mode(port: int):
     """Network mode: LAN accessible via browser (no Electron needed)."""
-    os.environ.setdefault("IA_AUTH_ENABLE", "1")
     print("  纯浏览器模式（无 Electron）")
     print()
     _print_access_info(port)
@@ -595,8 +595,8 @@ def main():
         if not build_frontend(force=args.rebuild):
             print()
             print("  前端构建失败，可以用 --no-build 跳过（需先手动构建）：")
-            print(f"    cd frontend && npm install && npm run build && cd ..")
-            print(f"    python start.py --no-build")
+            print("    cd frontend && npm install && npm run build && cd ..")
+            print("    python start.py --no-build")
             sys.exit(1)
 
     mode_label = "Electron 桌面窗口" if args.mode == "desktop" else "局域网浏览器"

@@ -185,8 +185,7 @@ export function getShortcutDisplay(accelerator: string) {
   return out.join(isMacPlatform() ? '' : '+')
 }
 
-const VALID_ACTIONS = new Set<string>(Object.keys(defaultShortcuts))
-const SUPPORTED_KEY_RE = /^(?:Tab|CommandOrControl(\+Shift)?(\+Alt)?\+([A-Za-z0-9./\\\- =;,'`\[\]\{\}]|Tab|Enter|Escape|Up|Down|Left|Right))$/
+const SUPPORTED_KEY_RE = /^(?:Tab|CommandOrControl(\+Shift)?(\+Alt)?\+([A-Za-z0-9./\\\- =;,'`[\]{}]|Tab|Enter|Escape|Up|Down|Left|Right))$/
 
 export function mergeShortcutConfigs(
   input: Record<string, Partial<ShortcutConfig> | Record<string, unknown>> | undefined,

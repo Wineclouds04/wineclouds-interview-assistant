@@ -230,7 +230,7 @@ async def api_ask_from_server_screen():
     if not has_vision_model():
         raise HTTPException(400, "\u8bf7\u81f3\u5c11\u914d\u7f6e\u4e00\u4e2a\u652f\u6301\u8bc6\u56fe\u4e14\u5df2\u586b\u5199 API Key \u7684\u6a21\u578b")
     try:
-        data_url = capture_primary_left_half_data_url()
+        data_url = await run_in_threadpool(capture_primary_left_half_data_url)
     except ScreenCaptureError as e:
         raise HTTPException(503, str(e))
     cfg = get_config()
@@ -250,7 +250,7 @@ async def api_capture_server_screen():
     from services.capture import ScreenCaptureError, capture_primary_left_half_data_url
 
     try:
-        return {"ok": True, "image": capture_primary_left_half_data_url()}
+        return {"ok": True, "image": await run_in_threadpool(capture_primary_left_half_data_url)}
     except ScreenCaptureError as e:
         raise HTTPException(503, str(e))
 

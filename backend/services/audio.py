@@ -116,7 +116,7 @@ def _get_sc_loopback_devices() -> list[dict]:
                 "is_default_output": is_default,
             })
     except Exception:
-        pass
+        _alog.debug("soundcard loopback enumeration failed", exc_info=True)
     if next_map:
         _SC_ID_MAP.clear()
         _SC_ID_MAP.update(next_map)

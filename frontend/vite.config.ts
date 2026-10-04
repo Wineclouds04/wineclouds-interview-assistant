@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig, type HttpProxy } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
@@ -42,6 +42,14 @@ function manualChunks(id: string) {
   }
 }
 
+// The backend skips token auth only for same-origin loopback requests. Requests
+// proxied from the Vite dev server carry `Origin: http://localhost:5173`, so drop
+// that header: the proxy itself is the (loopback, non-browser) client.
+function stripOrigin(proxy: HttpProxy.Server) {
+  proxy.on('proxyReq', (proxyReq) => proxyReq.removeHeader('origin'))
+  proxy.on('proxyReqWs', (proxyReq) => proxyReq.removeHeader('origin'))
+}
+
 export default defineConfig({
   plugins: [react()],
   resolve: {
@@ -51,10 +59,14 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://localhost:18080',
+      '/api': {
+        target: 'http://localhost:18080',
+        configure: stripOrigin,
+      },
       '/ws': {
         target: 'ws://localhost:18080',
         ws: true,
+        configure: stripOrigin,
       },
     },
   },

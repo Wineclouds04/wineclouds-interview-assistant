@@ -13,6 +13,7 @@ from services.storage.paths import backend_root
 from . import loaders as _loaders  # noqa: F401  触发 register 副作用
 from .chunker import chunk_doc
 from .store import KBStore
+from .paths import resolve_kb_file_path
 
 _log = get_logger(__name__)
 
@@ -74,6 +75,7 @@ def reindex() -> dict[str, Any]:
             continue
         try:
             rel = str(path.relative_to(kb_dir)).replace(os.sep, "/")
+            resolve_kb_file_path(kb_dir, rel)
         except ValueError:
             continue
         ext = path.suffix.lower()
@@ -148,7 +150,7 @@ def reindex() -> dict[str, Any]:
 def reindex_file(rel_path: str) -> dict[str, Any]:
     """按相对路径重建单文件索引；文件不存在时删除记录。"""
     cfg = get_config()
-    path = resolve_path(cfg.kb_dir) / rel_path
+    path = resolve_kb_file_path(resolve_path(cfg.kb_dir), rel_path)
     store = _get_store()
     if not path.exists():
         store.delete_doc(rel_path)
@@ -158,9 +160,9 @@ def reindex_file(rel_path: str) -> dict[str, Any]:
 
 def remove_file(rel_path: str) -> None:
     """删除索引 + 磁盘文件。失败不抛。"""
+    full = resolve_kb_file_path(resolve_path(get_config().kb_dir), rel_path)
     store = _get_store()
     store.delete_doc(rel_path)
-    full = resolve_path(get_config().kb_dir) / rel_path
     try:
         if full.exists():
             full.unlink()

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useInterviewStore } from '@/stores/configStore'
 import { useShallow } from 'zustand/react/shallow'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'

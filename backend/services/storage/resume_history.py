@@ -15,6 +15,10 @@ from typing import Any, Optional
 from core.config import get_config, update_config
 from services.resume import parse_resume_bytes, summarize_resume
 from services.storage.paths import data_dir, sqlite_path
+from services.storage.db import connect
+from core.logger import get_logger
+
+_log = get_logger("storage.resume_history")
 
 MAX_ENTRIES = 10
 # 单次上传字节数上限。Router 层 (api.common.router) 也以此为流式校验阈值,
@@ -51,9 +55,7 @@ def _row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = connect(DB_PATH)
     _ensure_resume_summary_column(conn)
     return conn
 
@@ -418,4 +420,5 @@ def restore_active_resume() -> bool:
         apply_entry(active_id)
         return True
     except Exception:
+        _log.warning("Failed to restore active resume %s", active_id, exc_info=True)
         return False

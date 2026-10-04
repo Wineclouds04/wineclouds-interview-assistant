@@ -87,7 +87,7 @@ def _extract_repr(line: str, key: str) -> str:
         return ""
     try:
         value = ast.literal_eval(match.group(1))
-    except Exception:
+    except (ValueError, SyntaxError):
         return ""
     return str(value or "").strip()
 

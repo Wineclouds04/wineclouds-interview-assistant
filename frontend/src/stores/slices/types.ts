@@ -44,12 +44,18 @@ export interface AppConfig {
   whisper_language: string
   whisper_preload: boolean
   doubao_stt_app_id: string
+  /** Always '' from the server; see doubao_stt_access_token_set. */
   doubao_stt_access_token: string
+  doubao_stt_access_token_set?: boolean
+  /** Always '' from the server; see doubao_stt_api_key_set. */
   doubao_stt_api_key: string
+  doubao_stt_api_key_set?: boolean
   doubao_stt_resource_id: string
   doubao_stt_boosting_table_id: string
   generic_stt_api_base_url: string
+  /** Always '' from the server; see generic_stt_api_key_set. */
   generic_stt_api_key: string
+  generic_stt_api_key_set?: boolean
   generic_stt_model: string
   generic_stt_custom_headers: string
   candidate_asr_enabled?: boolean

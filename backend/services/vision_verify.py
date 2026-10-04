@@ -92,7 +92,7 @@ def _normalize_image_data_url(image_data_url: str) -> str:
         return raw
     try:
         base64.b64decode(raw, validate=True)
-    except Exception:
+    except ValueError:  # binascii.Error is a ValueError
         return raw
     return f"data:image/png;base64,{raw}"
 
@@ -201,7 +201,7 @@ def schedule_self_verify(
                 "reason": result["reason"],
             })
         except Exception:  # noqa: BLE001
-            pass
+            _log.debug("vision verify broadcast failed", exc_info=True)
         finally:
             _VERIFY_SEMAPHORE.release()
 

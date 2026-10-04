@@ -284,6 +284,7 @@ class DoubaoSTT:
                     try:
                         raw = ws.recv()
                     except Exception:
+                        _log.debug("STT websocket recv ended", exc_info=True)
                         break
                     if first_packet:
                         ws.settimeout(15)
@@ -397,7 +398,7 @@ class GenericHTTPSTT:
             else:
                 try:
                     payload = resp.json()
-                except Exception:
+                except ValueError:
                     payload = resp.text
             text = self._extract_text(payload)
             return _postprocess(text) if text else ""

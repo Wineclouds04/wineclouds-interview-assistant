@@ -13,7 +13,8 @@ def backend_root() -> str:
 
 
 def data_dir() -> str:
-    d = os.path.join(_BACKEND_ROOT, "data")
+    # IA_DATA_DIR lets tests (or a portable install) keep databases elsewhere.
+    d = os.environ.get("IA_DATA_DIR") or os.path.join(_BACKEND_ROOT, "data")
     os.makedirs(d, exist_ok=True)
     return d
 

@@ -186,7 +186,7 @@ def select_exam_preflight_model(cfg):
 
     try:
         active_idx = max(0, min(int(getattr(cfg, "active_model", 0) or 0), len(models) - 1))
-    except Exception:
+    except (TypeError, ValueError):
         active_idx = 0
     order = [active_idx] + [i for i in range(len(models)) if i != active_idx]
 

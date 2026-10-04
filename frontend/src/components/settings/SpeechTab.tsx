@@ -163,6 +163,20 @@ function speechFormFromConfig(config: AppConfig): SpeechForm {
   }
 }
 
+// The backend never echoes saved STT credentials. Leaving a credential field
+// empty while one is saved sends this sentinel so the server keeps the old value.
+const STT_SECRET_KEEP = '__IA_KEEP_EXISTING_SECRET__'
+const STT_SECRET_FIELDS = ['doubao_stt_access_token', 'doubao_stt_api_key', 'generic_stt_api_key'] as const
+type SttSecretField = typeof STT_SECRET_FIELDS[number]
+
+function sttSecretSaved(config: AppConfig | null | undefined, field: SttSecretField): boolean {
+  return !!config?.[`${field}_set` as const]
+}
+
+function sttSecretPlaceholder(config: AppConfig | null | undefined, field: SttSecretField, fallback: string): string {
+  return sttSecretSaved(config, field) ? '已保存，留空保持不变' : fallback
+}
+
 function speechFormSnapshot(value: SpeechForm): string {
   return JSON.stringify(value)
 }
@@ -223,7 +237,11 @@ export default function SpeechTab() {
           clampIntegerInput(form.assist_realtime_high_churn_max_tokens, 128, 4096, 220),
         ),
       }
-      await updateConfigAndRefresh(savedForm)
+      const payload: Record<string, unknown> = { ...savedForm }
+      for (const field of STT_SECRET_FIELDS) {
+        if (!savedForm[field].trim() && sttSecretSaved(config, field)) payload[field] = STT_SECRET_KEEP
+      }
+      await updateConfigAndRefresh(payload)
       setForm(savedForm)
       markSaved(savedForm)
       setSaveState('saved')
@@ -280,8 +298,9 @@ export default function SpeechTab() {
 
   const credentialConfigured = (provider: string): boolean => {
     if (provider === 'whisper') return true
-    if (provider === 'doubao') return !!(form.doubao_stt_api_key || (form.doubao_stt_app_id && form.doubao_stt_access_token))
-    if (provider === 'generic') return !!(form.generic_stt_api_base_url && form.generic_stt_api_key && form.generic_stt_model)
+    const has = (field: SttSecretField) => !!form[field] || sttSecretSaved(config, field)
+    if (provider === 'doubao') return has('doubao_stt_api_key') || !!(form.doubao_stt_app_id && has('doubao_stt_access_token'))
+    if (provider === 'generic') return !!(form.generic_stt_api_base_url && has('generic_stt_api_key') && form.generic_stt_model)
     return false
   }
 
@@ -433,13 +452,13 @@ export default function SpeechTab() {
         {form.stt_provider === 'doubao' && (
           <>
             <Field label="API Key（新版控制台）" hint="优先使用；请从豆包语音控制台获取 UUID 格式的 API Key。ark- 开头的是方舟模型 Key，不能用于语音识别">
-              <input type="text" value={form.doubao_stt_api_key} onChange={(e) => setForm({ ...form, doubao_stt_api_key: e.target.value })} placeholder="填入 API Key（UUID 格式）" className="input-field" />
+              <input type="text" value={form.doubao_stt_api_key} onChange={(e) => setForm({ ...form, doubao_stt_api_key: e.target.value })} placeholder={sttSecretPlaceholder(config, 'doubao_stt_api_key', '填入 API Key（UUID 格式）')} className="input-field" />
             </Field>
             <Field label="App ID（旧版控制台）" hint="使用旧版控制台时填写，新版无需填">
               <input type="text" value={form.doubao_stt_app_id} onChange={(e) => setForm({ ...form, doubao_stt_app_id: e.target.value })} placeholder="如：123456789" className="input-field" />
             </Field>
             <Field label="Access Token（旧版控制台）" hint="使用旧版控制台时填写，新版无需填">
-              <input type="text" value={form.doubao_stt_access_token} onChange={(e) => setForm({ ...form, doubao_stt_access_token: e.target.value })} placeholder="填入 Access Token" className="input-field" />
+              <input type="text" value={form.doubao_stt_access_token} onChange={(e) => setForm({ ...form, doubao_stt_access_token: e.target.value })} placeholder={sttSecretPlaceholder(config, 'doubao_stt_access_token', '填入 Access Token')} className="input-field" />
             </Field>
             <Field label="Resource ID" hint="默认为流式语音识别 1.0 小时版">
               <input type="text" value={form.doubao_stt_resource_id} onChange={(e) => setForm({ ...form, doubao_stt_resource_id: e.target.value })} className="input-field" />
@@ -456,7 +475,7 @@ export default function SpeechTab() {
               <input type="text" value={form.generic_stt_api_base_url} onChange={(e) => setForm({ ...form, generic_stt_api_base_url: e.target.value })} placeholder="https://.../v1" className="input-field" />
             </Field>
             <Field label="API Key" hint="Bearer token">
-              <input type="text" value={form.generic_stt_api_key} onChange={(e) => setForm({ ...form, generic_stt_api_key: e.target.value })} placeholder="填入 API Key" className="input-field" />
+              <input type="text" value={form.generic_stt_api_key} onChange={(e) => setForm({ ...form, generic_stt_api_key: e.target.value })} placeholder={sttSecretPlaceholder(config, 'generic_stt_api_key', '填入 API Key')} className="input-field" />
             </Field>
             <Field label="Model" hint="例如 whisper-1 / qwen-audio-asr / 供应商模型名">
               <input type="text" value={form.generic_stt_model} onChange={(e) => setForm({ ...form, generic_stt_model: e.target.value })} placeholder="模型名" className="input-field" />

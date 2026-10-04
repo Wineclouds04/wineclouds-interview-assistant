@@ -8,11 +8,13 @@ import os
 import re
 import secrets
 
-from core.logger import get_logger
-
-logger = get_logger(__name__)
 import shutil
+import tempfile
 import threading
+import time
+
+from core import secret_store
+from core.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -347,26 +349,44 @@ class AppConfig(BaseModel):
 
 _config: Optional[AppConfig] = None
 _config_lock = threading.RLock()
+# Keychain references held by config.json on disk (see core.secret_store).
+_stored_secret_refs: set[str] = set()
+_unresolved_secret_refs: set[str] = set()
+_secret_retry_at = 0.0
+
+
+class ConfigSaveError(RuntimeError):
+    """A configuration change could not safely be persisted."""
 
 
 def get_config() -> AppConfig:
     global _config
     with _config_lock:
-        if _config is None:
+        if _config is None or (_unresolved_secret_refs and time.monotonic() >= _secret_retry_at):
             _config = _load_config()
         return _config
+
+
+def ensure_secrets_available() -> AppConfig:
+    with _config_lock:
+        cfg = get_config()
+        if _unresolved_secret_refs:
+            raise ConfigSaveError("系统钥匙串暂时不可用，请解锁后重试保存；原配置和密钥已保留")
+        return cfg
 
 
 def update_config(updates: dict) -> AppConfig:
     global _config
     with _config_lock:
-        cfg = get_config()
+        # Unreadable credentials must never become user-cleared values.
+        cfg = ensure_secrets_available()
         data = cfg.model_dump()
         for k, v in updates.items():
             if hasattr(cfg, k):
                 data[k] = v
-        _config = AppConfig(**data)
-        _save_config(_config)
+        candidate = AppConfig(**data)
+        _save_config(candidate)
+        _config = candidate
         return _config
 
 
@@ -380,24 +400,64 @@ def _load_config() -> AppConfig:
             shutil.copy2(CONFIG_EXAMPLE, CONFIG_FILE)
             print("[Config] 已从 config.example.json 创建 config.json，请填入你的 API Key")
     if os.path.exists(CONFIG_FILE):
+        global _stored_secret_refs, _unresolved_secret_refs, _secret_retry_at
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return AppConfig(**json.load(f))
+                raw = json.load(f)
+            _stored_secret_refs = secret_store.collect_refs(raw)
+            unresolved: set[str] = set()
+            needs_migration = secret_store.resolve_secrets(raw, unresolved_refs=unresolved)
+            cfg = AppConfig(**raw)
+            _unresolved_secret_refs = unresolved
+            _secret_retry_at = time.monotonic() + 5.0
         except Exception as e:
-            print(f"[Config] 配置文件解析失败: {e}，使用默认配置")
+            logger.error("配置文件解析失败: %s，使用默认配置", e)
+            return AppConfig()
+        if needs_migration and not _unresolved_secret_refs:
+            logger.info("Moving API keys from config.json into the OS keychain")
+            try:
+                _save_config(cfg)
+            except ConfigSaveError:
+                # A failed migration must not make a valid config unusable.
+                pass
+        return cfg
     return AppConfig()
 
 
 def _save_config(cfg: AppConfig) -> bool:
+    global _stored_secret_refs
+    if _unresolved_secret_refs:
+        raise ConfigSaveError("系统钥匙串暂时不可用，请解锁后重试保存；原配置和密钥已保留")
     try:
         data = cfg.model_dump()
         data.pop("resume_text", None)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        new_refs = secret_store.store_secrets(data)
+        _write_json_atomic(CONFIG_FILE, data)
+        # Delete keychain entries only after the file no longer points at them.
+        secret_store.delete_refs(_stored_secret_refs - new_refs)
+        _stored_secret_refs = new_refs
         return True
     except Exception as e:
         logger.warning("保存配置失败: %s", e, exc_info=True)
-        return False
+        raise ConfigSaveError("配置保存失败，请检查磁盘空间及文件写入权限后重试") from e
+
+
+def _write_json_atomic(path: str, data: dict) -> None:
+    """Write via a temp file + rename so a crash never leaves a truncated file."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 POSITION_OPTIONS = [

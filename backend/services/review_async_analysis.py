@@ -82,9 +82,14 @@ def _analyze_session_worker(session_id: int):
 
         # 逐题分析
         analyzed_turns = []
+        failed_turns = False
         for turn in turns:
             if turn["is_partial"]:
                 logger.info("Skip partial turn: session_id=%d, turn_id=%d", session_id, turn["id"])
+                continue
+
+            if review_analysis.is_successful_turn_analysis(turn):
+                analyzed_turns.append(turn)
                 continue
 
             try:
@@ -96,6 +101,8 @@ def _analyze_session_worker(session_id: int):
                     review_source=review_source,
                 )
 
+                if not review_analysis.is_successful_turn_analysis(result):
+                    raise review_analysis.ReviewAnalysisError("模型未返回有效的逐题分析")
                 # 更新 turn（包括纠正后的候选人回答）
                 review.update_turn_analysis(
                     turn_id=turn["id"],
@@ -119,6 +126,7 @@ def _analyze_session_worker(session_id: int):
                 logger.info("Analyzed turn: session_id=%d, turn_id=%d", session_id, turn["id"])
 
             except Exception as e:
+                failed_turns = True
                 logger.error(
                     "Failed to analyze turn: session_id=%d, turn_id=%d, error=%s",
                     session_id,
@@ -131,12 +139,18 @@ def _analyze_session_worker(session_id: int):
                     analysis_status="failed",
                 )
 
+        if failed_turns:
+            review.update_session_status(session_id, "analysis_failed")
+            return
+
         try:
             summary_result = review_analysis.generate_summary(
                 turns=analyzed_turns,
                 review_source=review_source,
             )
 
+            if not review_analysis.is_successful_summary(summary_result.get("summary_markdown")):
+                raise review_analysis.ReviewAnalysisError("模型未返回有效的总结")
             # 计算平均分
             all_scores = []
             for t in analyzed_turns:
@@ -161,6 +175,8 @@ def _analyze_session_worker(session_id: int):
                 e,
                 exc_info=True,
             )
+            review.update_session_status(session_id, "analysis_failed")
+            return
 
         # 标记为完成
         review.update_session_status(session_id, "completed")
@@ -176,4 +192,4 @@ def _analyze_session_worker(session_id: int):
         try:
             review.update_session_status(session_id, "analysis_failed")
         except Exception:
-            pass
+            logger.warning("Could not mark session %s as analysis_failed", session_id, exc_info=True)

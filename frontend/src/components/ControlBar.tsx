@@ -68,7 +68,6 @@ export default function ControlBar() {
     sttActiveProvider,
     candidateSttLoaded,
     candidateSttLoading,
-    candidateSttProvider,
   } = useInterviewStore(
     useShallow((s) => ({
       isRecording: s.isRecording,
@@ -92,7 +91,6 @@ export default function ControlBar() {
       sttActiveProvider: s.sttActiveProvider ?? '',
       candidateSttLoaded: s.candidateSttLoaded ?? false,
       candidateSttLoading: s.candidateSttLoading ?? false,
-      candidateSttProvider: s.candidateSttProvider ?? '',
     })),
   )
   const [selectedDevice, setSelectedDevice] = useState<number | null>(null)

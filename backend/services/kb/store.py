@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from core.logger import get_logger
+from services.storage.db import connect
 
 from ._tokenize import cjk_bigram_text
 from .types import Chunk
@@ -64,11 +65,8 @@ class KBStore:
         self._lock = threading.RLock()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=5.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        # Short timeout: the retriever watchdog would rather give up than stall a live answer.
+        return connect(self.db_path, foreign_keys=True, timeout=5.0)
 
     def close(self) -> None:
         pass

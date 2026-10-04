@@ -537,7 +537,7 @@ def _stream_via_http(model_cfg, full_messages, cfg, think_params):
         if resp.status_code >= 400:
             try:
                 body = resp.json()
-            except Exception:
+            except ValueError:
                 body = resp.text
             text = str(body)[:200]
             if resp.status_code in (401, 403):
@@ -562,7 +562,7 @@ def _stream_via_http(model_cfg, full_messages, cfg, think_params):
                 break
             try:
                 obj = json.loads(data)
-            except Exception:
+            except ValueError:
                 continue
             choices = obj.get("choices") or []
             usage = obj.get("usage")

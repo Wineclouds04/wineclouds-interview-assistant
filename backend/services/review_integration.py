@@ -6,7 +6,7 @@ import time
 from typing import Optional
 
 from core.logger import get_logger
-from core.session import Session
+from core.session import Session, conversation_lock, get_session
 from core.config import get_config
 from services.storage import review
 from services import review_async_analysis
@@ -56,12 +56,18 @@ def on_assist_start(
     candidate_device_id: Optional[int],
     candidate_asr_enabled: bool,
     written_exam_mode: bool = False,
+    *,
+    session: Optional[Session] = None,
 ) -> Optional[int]:
     """
     Assist 启动时调用，创建 review session
     返回 session_id 或 None
     """
     global _current_review_session_id
+
+    active_session = session if session is not None else get_session()
+    with conversation_lock:
+        active_session.begin_interview()
 
     if not should_create_review_session(
         interviewer_device_id,
@@ -105,8 +111,10 @@ def on_assist_stop(session: Session) -> Optional[int]:
     _current_review_session_id = None
 
     try:
-        # 保存所有 QA turns
-        for idx, qa in enumerate(session.qa_pairs, start=1):
+        # Old cards remain visible, but only this interview belongs in its archive.
+        with conversation_lock:
+            current_qas = session.current_interview_qas()
+        for idx, qa in enumerate(current_qas, start=1):
             candidate_answer = session.get_candidate_answer_for_qa(qa.id, max_chars=2000)
             evidence = _build_turn_evidence(qa)
             review.add_turn(
@@ -126,7 +134,7 @@ def on_assist_stop(session: Session) -> Optional[int]:
         # recorded, 保留 ended_at, 等待前端手动触发 (POST /review/sessions/{id}/generate)。
         # 笔试练习即使只有 1 题也自动生成报告；看板自动同步仍由 AUTO_REVIEW_SYNC_MIN_TURNS 控制。
         # completed 只表示分析结果已经生成。
-        turn_count = len(session.qa_pairs)
+        turn_count = len(current_qas)
         source = str((review.get_session_detail(session_id) or {}).get("source") or "assist")
         auto_analyze = _should_auto_analyze(
             review_enabled=bool(get_config().review_enabled),

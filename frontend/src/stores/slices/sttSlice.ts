@@ -44,7 +44,7 @@ export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) =
   modelHealthLatency: {},
   tokenUsage: { prompt: 0, completion: 0, total: 0, byModel: {} },
 
-  setSttStatus: (loaded, loading, provider) => set((s) => {
+  setSttStatus: (loaded, loading, provider) => set(() => {
     if (provider === 'whisper-preload') {
       return { sttFallbackLoaded: loaded }
     }
@@ -54,7 +54,7 @@ export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) =
       ...(provider != null ? { sttActiveProvider: provider } : {}),
     }
   }),
-  setCandidateSttStatus: (loaded, loading, provider) => set((s) => ({
+  setCandidateSttStatus: (loaded, loading, provider) => set(() => ({
     candidateSttLoaded: loaded,
     candidateSttLoading: loading,
     ...(provider != null ? { candidateSttProvider: provider } : {}),

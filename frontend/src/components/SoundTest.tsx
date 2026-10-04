@@ -163,7 +163,9 @@ export default function SoundTest() {
         ...prev,
         [step]: { status, detail, answer, question, transcript, expected_phrase, first_token_ms, total_ms, model_name },
       }))
-    } catch {}
+    } catch {
+      /* ignore malformed progress messages */
+    }
   }, [])
 
   useEffect(() => {

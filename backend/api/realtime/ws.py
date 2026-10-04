@@ -41,6 +41,7 @@ async def _safe_send(ws: WebSocket, data: dict) -> bool:
         _log.warning("WS send timeout, dropping client")
         return False
     except Exception:
+        _log.debug("WS send failed, dropping client", exc_info=True)
         return False
 
 

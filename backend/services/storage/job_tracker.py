@@ -10,6 +10,10 @@ import time
 from typing import Any, Optional
 
 from services.storage.paths import sqlite_path
+from services.storage.db import connect
+from core.logger import get_logger
+
+_log = get_logger("storage.job_tracker")
 
 DB_PATH = sqlite_path("job_tracker.db")
 _db_lock = threading.Lock()
@@ -34,11 +38,7 @@ STAGE_VALUES = (
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return connect(DB_PATH, foreign_keys=True)
 
 
 def init_db() -> None:
@@ -280,7 +280,7 @@ def patch_application(app_id: int, data: dict[str, Any]) -> Optional[dict[str, A
 
             review.sync_review_metadata_from_application(app_id)
         except Exception:
-            pass
+            _log.warning("Failed to sync review metadata for application %s", app_id, exc_info=True)
         row = get_application(app_id)
     return row
 

@@ -30,3 +30,12 @@ ignore = [
 "tests/*" = ["F811", "B011", "F841"]
 "scripts/*" = ["E402"]
 "__init__.py" = ["F401", "F403"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+filterwarnings = [
+    # starlette.testclient still runs on httpx; harmless for tests.
+    "ignore::DeprecationWarning:starlette.testclient",
+    "ignore:Using `httpx` with `starlette.testclient`",
+]

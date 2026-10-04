@@ -1,0 +1,9 @@
+# Lint config for the top-level launcher scripts. backend/ has its own
+# pyproject.toml with the same rule set.
+target-version = "py310"
+line-length = 120
+extend-exclude = ["backend", "frontend", "desktop", ".venv", ".runtime"]
+
+[lint]
+select = ["E9", "F", "B0"]
+ignore = ["E501", "E402", "B008", "B904"]

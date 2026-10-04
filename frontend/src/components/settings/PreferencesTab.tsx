@@ -635,7 +635,9 @@ export default function PreferencesTab() {
                     onChange={async (v) => {
                       try {
                         await autoSave.saveNow({ written_exam_think: v })
-                      } catch {}
+                      } catch {
+                        /* autoSave already surfaces the error state */
+                      }
                     }}
                     label={config?.written_exam_think ? '已开启（更准但更慢）' : '已关闭（更快）'}
                   />

@@ -270,12 +270,12 @@ def _post_chat(model, payload: dict, timeout: int = 12) -> tuple[dict, int]:
     if response.status_code >= 400:
         try:
             body = response.json()
-        except Exception:
+        except ValueError:
             body = response.text
         raise RuntimeError(f"HTTP {response.status_code}: {str(body)[:200]}")
     try:
         body = response.json()
-    except Exception:
+    except ValueError:
         body = {}
     return body, latency_ms
 

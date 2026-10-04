@@ -1,0 +1,16 @@
+* text=auto
+*.py text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=crlf
+# Preserve tested Windows launcher bytes in clones and source ZIP downloads.
+*.cmd -text whitespace=cr-at-eol
+*.bat -text whitespace=cr-at-eol
+*.png -text
+*.ico -text
+*.wav -text

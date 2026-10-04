@@ -1,0 +1,10 @@
+# Optional: NVIDIA GPU acceleration for local Whisper.
+#   pip install -r backend/requirements-gpu.txt
+#   python quick-start.py --gpu
+#
+# CTranslate2's Windows wheel uses the NVIDIA CUDA 12 runtime at inference
+# time.  Driver-only machines can see the GPU but otherwise fail on the first
+# segment with a missing cublas/cudnn DLL (the app then falls back to CPU).
+-r requirements.txt
+nvidia-cublas-cu12>=12.4,<13.0; platform_system == "Windows"
+nvidia-cudnn-cu12>=9.0,<10.0; platform_system == "Windows"

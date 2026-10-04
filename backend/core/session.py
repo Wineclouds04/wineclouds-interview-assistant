@@ -1,7 +1,12 @@
 import time
 import threading
+import uuid
 from typing import Optional, Union
 from dataclasses import asdict, dataclass, field
+
+from core.logger import get_logger
+
+_log = get_logger("session")
 
 
 @dataclass
@@ -14,6 +19,7 @@ class QAPair:
     model_name: str = ""
     vision_verify_verdict: str = ""
     vision_verify_reason: str = ""
+    interview_id: str = ""
 
 
 @dataclass
@@ -48,6 +54,8 @@ class Session:
     created_at: float = field(default_factory=time.time)
     system_summary: str = ""
     _compaction_running: bool = False
+    _conversation_epoch: int = 0
+    interview_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     MAX_HISTORY = 20
     MAX_TRANSCRIPTION_HISTORY = 200
@@ -178,6 +186,7 @@ class Session:
             answer=answer,
             source=source,
             model_name=model_name,
+            interview_id=self.interview_id,
         )
         self.qa_pairs.append(qa)
         if len(self.qa_pairs) > self.MAX_QA_PAIRS:
@@ -303,7 +312,20 @@ class Session:
         return other_parts or "", 0
 
     def get_last_qa(self) -> Optional['QAPair']:
-        return self.qa_pairs[-1] if self.qa_pairs else None
+        return next((qa for qa in reversed(self.qa_pairs) if qa.interview_id == self.interview_id), None)
+
+    def current_interview_qas(self) -> list[QAPair]:
+        return [qa for qa in self.qa_pairs if qa.interview_id == self.interview_id]
+
+    def begin_interview(self) -> None:
+        """Keep displayed QA cards while starting independent interview context."""
+        self.interview_id = uuid.uuid4().hex
+        self._conversation_epoch += 1
+        self.conversation_history.clear()
+        self.system_summary = ""
+        self._compaction_running = False
+        self.close_candidate_answer_window()
+        self.mark_candidate_asr_idle()
 
     def get_recent_transcription(self, n: int = 10) -> str:
         recent = self.transcription_history[-n:]
@@ -322,13 +344,17 @@ class Session:
         try:
             from services.memory import schedule_compaction
         except Exception:
+            _log.warning("Conversation compaction unavailable", exc_info=True)
             return
         try:
             schedule_compaction(self)
         except Exception:
+            _log.warning("Failed to schedule conversation compaction", exc_info=True)
             self._compaction_running = False
 
     def clear(self):
+        self._conversation_epoch += 1
+        self.interview_id = uuid.uuid4().hex
         self.transcription_history.clear()
         self.candidate_transcription_history.clear()
         self.candidate_answer_segments.clear()
@@ -367,6 +393,7 @@ class Session:
 
     def _serialize_qa_pair(self, qa: QAPair) -> dict:
         payload = asdict(qa)
+        payload.pop("interview_id", None)
         verdict = str(payload.pop("vision_verify_verdict", "") or "")
         reason = str(payload.pop("vision_verify_reason", "") or "")
         payload["source"] = getattr(qa, "source", "") or ""

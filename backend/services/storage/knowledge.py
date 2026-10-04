@@ -9,6 +9,7 @@ from core.config import get_config
 from core.logger import get_logger
 from services.llm import get_client
 from services.storage.paths import sqlite_path
+from services.storage.db import connect
 
 DB_PATH = sqlite_path("knowledge.db")
 _db_lock = threading.Lock()
@@ -16,10 +17,7 @@ _tag_log = get_logger("knowledge.tags")
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return connect(DB_PATH)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -49,7 +47,7 @@ def init_db():
         try:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_question_records_qa_id ON question_records(qa_id)")
         except Exception:
-            pass
+            _tag_log.warning("knowledge.db index creation failed", exc_info=True)
         conn.commit()
         conn.close()
 
@@ -165,6 +163,7 @@ def update_candidate_answer_for_qa(
             if tags:
                 tags_json = json.dumps(tags, ensure_ascii=False)
         except Exception:
+            _tag_log.debug("Tag extraction failed", exc_info=True)
             tags_json = None
 
     with _db_lock:
@@ -199,7 +198,7 @@ def get_summary(session_types: Optional[tuple[str, ...]] = None) -> list[dict]:
     for row in rows:
         try:
             tags = json.loads(row["tags"]) if row["tags"] else []
-        except Exception:
+        except (TypeError, ValueError):
             tags = []
         for tag in tags:
             if tag not in tag_data:
@@ -255,7 +254,7 @@ def get_history(
     for row in rows:
         try:
             tags = json.loads(row["tags"]) if row["tags"] else []
-        except Exception:
+        except (TypeError, ValueError):
             tags = []
         records.append({
             "id": row["id"],

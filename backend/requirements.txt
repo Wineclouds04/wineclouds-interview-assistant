@@ -21,13 +21,14 @@ soundcard>=0.4.3,<1.0
 # current 2.x wheel on Python 3.14+.
 numpy>=1.24.0,<2.0; python_version < "3.14"
 numpy>=2.0.0,<3.0; python_version >= "3.14"
+# Local Whisper runs on CPU out of the box. For NVIDIA GPU inference install
+# requirements-gpu.txt as well (adds ~1-2 GB of CUDA runtime libraries); without
+# it, GPU machines automatically fall back to CPU int8.
 faster-whisper>=1.0.0,<2.0
-# CTranslate2's Windows wheel uses the NVIDIA CUDA 12 runtime at inference
-# time.  Driver-only machines can see the GPU but otherwise fail on the first
-# segment with a missing cublas/cudnn DLL.
-nvidia-cublas-cu12>=12.4,<13.0; platform_system == "Windows"
-nvidia-cudnn-cu12>=9.0,<10.0; platform_system == "Windows"
 pydantic>=2.5.0,<3.0
+# API keys are stored in the OS keychain (Windows Credential Manager / macOS
+# Keychain / Secret Service) instead of config.json. Set IA_SECRET_STORE=plaintext to opt out.
+keyring>=24.0,<26.0
 qrcode>=7.4,<8.0
 # 手机端「左屏审题」：服务端截取本机主屏左半部分
 mss>=9.0.0,<10.0

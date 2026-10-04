@@ -75,7 +75,7 @@ function RadarChart({ tags }: { tags: TagSummary[] }) {
         }).join(' ')
         return <polygon key={level} points={gp} fill="none" stroke="currentColor" className="text-bg-hover" strokeWidth="0.5" />
       })}
-      {points.map((p, i) => (
+      {points.map((_p, i) => (
         <line key={i} x1={cx} y1={cy} x2={cx + r * Math.cos((Math.PI * 2 * i) / n - Math.PI / 2)}
           y2={cy + r * Math.sin((Math.PI * 2 * i) / n - Math.PI / 2)}
           stroke="currentColor" className="text-bg-hover" strokeWidth="0.5" />

@@ -27,6 +27,7 @@ BACKEND_DIR = os.path.join(ROOT, "backend")
 FRONTEND_DIR = os.path.join(ROOT, "frontend")
 DESKTOP_DIR = os.path.join(ROOT, "desktop")
 REQUIREMENTS = os.path.join(BACKEND_DIR, "requirements.txt")
+REQUIREMENTS_GPU = os.path.join(BACKEND_DIR, "requirements-gpu.txt")
 HIDE_CONSOLE_ENV = "IA_HIDE_CONSOLE"
 DEFAULT_PORT = 18080
 DEFAULT_READY_TIMEOUT_SEC = 180
@@ -50,7 +51,7 @@ def _run_step(label: str, cmd: list[str], cwd: str) -> bool:
     return True
 
 
-def install_dependencies() -> bool:
+def install_dependencies(gpu: bool = False) -> bool:
     """Install Python and frontend dependencies before launching.
 
     Electron desktop dependencies are intentionally NOT installed here.
@@ -64,7 +65,11 @@ def install_dependencies() -> bool:
         return False
 
     steps = [
-        ("安装后端 Python 依赖", [sys.executable, "-m", "pip", "install", "-r", REQUIREMENTS], ROOT),
+        (
+            "安装后端 Python 依赖" + ("（含 GPU 加速）" if gpu else ""),
+            [sys.executable, "-m", "pip", "install", "-r", REQUIREMENTS_GPU if gpu else REQUIREMENTS],
+            ROOT,
+        ),
         ("安装前端 npm 依赖", [npm, "install"], FRONTEND_DIR),
     ]
     for label, cmd, cwd in steps:
@@ -196,6 +201,11 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--skip-install", action="store_true", help="跳过 install 步骤，直接启动")
     parser.add_argument("--install-only", action="store_true", help="只安装依赖，不启动应用")
     parser.add_argument("--foreground", action="store_true", help="Windows 下也保留命令行窗口并显示启动日志")
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="额外安装 NVIDIA CUDA 运行库，用 GPU 跑本地 Whisper（约 1-2 GB）",
+    )
     return parser.parse_known_args(argv)
 
 
@@ -203,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     args, start_args = parse_args(sys.argv[1:] if argv is None else argv)
 
     if not args.skip_install:
-        if not install_dependencies():
+        if not install_dependencies(gpu=args.gpu):
             return 1
 
     if args.install_only:
